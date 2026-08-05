@@ -269,6 +269,9 @@ const PALETTE_KEYS = Object.keys(PALETTES);
 // If the files are missing, the coin falls back to its palette gradient.
 const DEFAULT_FRONT = "/images/coins/front.png";
 const DEFAULT_BACK  = "/images/coins/back.png";
+// Start with a complete, balanced orbit. Seven coins gives the hero enough
+// presence without making the individual faces feel crowded or cropped.
+const DEFAULT_COIN_COUNT = 7;
 
 const newId = () =>
   (typeof crypto !== "undefined" && crypto.randomUUID && crypto.randomUUID()) ||
@@ -379,9 +382,9 @@ export default function CoinStudio() {
 
   // Coin list — this is the source of truth.  Each entry is a "spec".
   const [coins, setCoins] = useState(() =>
-    PALETTE_KEYS.map((k, i) => ({
+    Array.from({ length: DEFAULT_COIN_COUNT }, (_, i) => ({
       key: newId(),
-      palette: k,
+      palette: PALETTE_KEYS[i % PALETTE_KEYS.length],
       front: DEFAULT_FRONT,
       back: DEFAULT_BACK,
       phase: i * 1.2,
@@ -636,7 +639,10 @@ export default function CoinStudio() {
       if (exportOverride.active) return; // don't fight the export sizing
       const w = mount.clientWidth, h = mount.clientHeight;
       if (!w || !h) return;
-      renderer.setSize(w, h, false);
+      // Keep the canvas's CSS dimensions in sync with the stage. With
+      // `updateStyle` disabled, the high-DPI drawing buffer became the layout
+      // size as well, which clipped the orbit to the top-left of the stage.
+      renderer.setSize(w, h);
       fitCamera();
     };
     const ro = new ResizeObserver(resize); ro.observe(mount); resize();
