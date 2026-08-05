@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useCallback } from "react";
 import * as THREE from "three";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
+import { RectAreaLightUniformsLib } from "three/examples/jsm/lights/RectAreaLightUniformsLib.js";
 
 // =========================================================================
 //  TEXTURE HELPERS
@@ -348,7 +349,8 @@ const DEFAULTS = {
   orbitR: 2.2, size: 0.6, thick: 0.13, overallScale: 0.7,
   metalness: 0.85, roughness: 0.28,
   light: 1, accent: 232, grid: true, autoOrbit: false,
-  bgColor: "#e9edff",
+  rightLightX: 7, rightLightY: 3.5, rightLightZ: 6,
+  bgColor: "#ffffff",
   rimColor: "#5b6bff",
   showRing: false, showShadow: false,
   glow: 0.4, glowRange: 1.6,
@@ -372,13 +374,60 @@ const EXPORT_PRESETS = {
 
 export default function CoinStudio() {
   const mountRef = useRef(null);
+  const stageRef = useRef(null);
+  const draggingLightRef = useRef(false);
   const api = useRef(null);
   const settings = useRef({ ...DEFAULTS });
   const [ui, setUi] = useState({ ...DEFAULTS });
+  const [draggingLight, setDraggingLight] = useState(false);
 
   const set = useCallback((patch) => {
     setUi((p) => { const n = { ...p, ...patch }; settings.current = n; return n; });
   }, []);
+
+  // The stage light control maps its on-screen position directly to the
+  // softbox's horizontal and vertical world coordinates.
+  const moveStageLight = useCallback((event) => {
+    const rect = stageRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+    const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+    set({
+      rightLightX: (x - 0.5) * 20,
+      rightLightY: (0.5 - y) * 20,
+    });
+  }, [set]);
+
+  const beginStageLightDrag = useCallback((event) => {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    draggingLightRef.current = true;
+    setDraggingLight(true);
+    moveStageLight(event);
+  }, [moveStageLight]);
+
+  // Listen on the window as well as the handle. This keeps the controller
+  // responsive when a drag crosses the canvas or leaves the source circle.
+  useEffect(() => {
+    const move = (event) => {
+      if (draggingLightRef.current) moveStageLight(event);
+    };
+    const end = () => {
+      if (!draggingLightRef.current) return;
+      draggingLightRef.current = false;
+      setDraggingLight(false);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("mousemove", move);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("mouseup", end);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("mouseup", end);
+    };
+  }, [moveStageLight]);
 
   // Coin list — this is the source of truth.  Each entry is a "spec".
   const [coins, setCoins] = useState(() =>
@@ -466,6 +515,7 @@ export default function CoinStudio() {
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.1;
     renderer.setClearColor(new THREE.Color(DEFAULTS.bgColor), 1);
+    RectAreaLightUniformsLib.init();
     // Image-based lighting — the reflections make metallic surfaces read as
     // truly physical rather than plastic.
     const pmrem = new THREE.PMREMGenerator(renderer);
@@ -483,6 +533,12 @@ export default function CoinStudio() {
     const fill = new THREE.DirectionalLight(0xe6ecff, 0.5);
     fill.position.set(6, -1, 5);
     scene.add(fill);
+    // A broad softbox on the upper-right/front gives the coins a clean,
+    // studio-style highlight rather than a small, harsh point reflection.
+    const rightSoftbox = new THREE.RectAreaLight(0xffffff, 7.5, 6, 6);
+    rightSoftbox.position.set(7, 3.5, 6);
+    rightSoftbox.lookAt(0, 0, 0);
+    scene.add(rightSoftbox);
     const rimL = new THREE.PointLight(0x5b6bff, 2.2, 60);
     rimL.position.set(-3, 3, -6); scene.add(rimL);
     const rimL2 = new THREE.PointLight(0x8a5bff, 1.6, 60);
@@ -673,6 +729,9 @@ export default function CoinStudio() {
       }
       keyL.intensity = 1.8 * s.light;
       amb.intensity = 0.55 * s.light;
+      rightSoftbox.intensity = 7.5 * s.light;
+      rightSoftbox.position.set(s.rightLightX, s.rightLightY, s.rightLightZ);
+      rightSoftbox.lookAt(0, 0, 0);
       rimL.intensity = 2.2 * s.light;
       rimL2.intensity = 1.6 * s.light;
 
@@ -984,6 +1043,18 @@ export default function CoinStudio() {
           <Row label="Intensity" value={ui.light.toFixed(2)}>
             <Slider min={0.2} max={2} step={0.01} value={ui.light} onChange={(v) => set({ light: v })} />
           </Row>
+          <div className="mb-4 rounded-lg border border-slate-700 bg-slate-800/40 p-3">
+            <div className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Right soft light</div>
+            <Row label="Horizontal" value={ui.rightLightX.toFixed(1)}>
+              <Slider min={-10} max={10} step={0.1} value={ui.rightLightX} onChange={(v) => set({ rightLightX: v })} />
+            </Row>
+            <Row label="Vertical" value={ui.rightLightY.toFixed(1)}>
+              <Slider min={-10} max={10} step={0.1} value={ui.rightLightY} onChange={(v) => set({ rightLightY: v })} />
+            </Row>
+            <Row label="Depth" value={ui.rightLightZ.toFixed(1)}>
+              <Slider min={-10} max={10} step={0.1} value={ui.rightLightZ} onChange={(v) => set({ rightLightZ: v })} />
+            </Row>
+          </div>
           <Row label="Accent hue" value={Math.round(ui.accent) + "°"}>
             <Slider min={0} max={360} step={1} value={ui.accent} onChange={(v) => set({ accent: v })} />
           </Row>
@@ -1138,7 +1209,7 @@ export default function CoinStudio() {
       </aside>
 
       {/* STAGE */}
-      <main className="relative flex-1 h-full overflow-hidden">
+      <main ref={stageRef} className="relative flex-1 h-full overflow-hidden">
         <div className="absolute inset-0" style={{ background: ui.bgColor }} />
         <div className="absolute inset-0"
           style={{ background: "radial-gradient(22% 24% at 50% 50%, rgba(120,130,255,0.20), transparent 70%)" }} />
@@ -1152,6 +1223,39 @@ export default function CoinStudio() {
           </div>
         </div>
         <div ref={mountRef} className="absolute inset-0 z-10" />
+        {/* On-canvas light source: drag it around the open space to choose
+            where the broad right softbox shines from. */}
+        <div className="absolute z-30 pointer-events-none"
+          style={{
+            left: `${5 + ((ui.rightLightX + 10) / 20) * 90}%`,
+            top: `${95 - ((ui.rightLightY + 10) / 20) * 90}%`,
+            transform: "translate(-50%, -50%)",
+          }}>
+          <button type="button"
+            onPointerDown={beginStageLightDrag}
+            onPointerUp={(event) => {
+              draggingLightRef.current = false;
+              setDraggingLight(false);
+              if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                event.currentTarget.releasePointerCapture(event.pointerId);
+              }
+            }}
+            onPointerCancel={() => { draggingLightRef.current = false; setDraggingLight(false); }}
+            onLostPointerCapture={() => { draggingLightRef.current = false; setDraggingLight(false); }}
+            className={"group pointer-events-auto flex flex-col items-center gap-2 select-none " +
+              (draggingLight ? "cursor-grabbing" : "cursor-grab")}>
+            <span className={"relative grid h-20 w-20 place-items-center rounded-full border-2 transition-all " +
+              (draggingLight
+                ? "border-indigo-400 bg-indigo-100/90 shadow-[0_0_0_10px_rgba(99,102,241,0.14),0_0_38px_rgba(99,102,241,0.45)]"
+                : "border-indigo-400/80 bg-white/75 shadow-[0_0_0_7px_rgba(99,102,241,0.10),0_8px_24px_rgba(67,56,202,0.25)] group-hover:border-indigo-500 group-hover:bg-white/95") }>
+              <span className="absolute inset-2 rounded-full border border-indigo-300/80" />
+              <span className="grid h-9 w-9 place-items-center rounded-full bg-indigo-500 text-lg text-white shadow-lg">✦</span>
+            </span>
+            <span className="rounded-full bg-slate-900/75 px-2.5 py-1 text-[11px] font-medium text-white shadow-sm backdrop-blur">
+              Drag light
+            </span>
+          </button>
+        </div>
         {/* Export frame overlay — dashed rectangle showing the target aspect */}
         {ui.showExportFrame && ui.exportPreset !== "viewport" && (() => {
           const preset = EXPORT_PRESETS[ui.exportPreset];
