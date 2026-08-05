@@ -223,21 +223,25 @@ function buildCoinMeshes(palette) {
     map: edge,
     normalMap: normal,
     normalScale: new THREE.Vector2(0.35, 0.35),
-    metalness: 0.95,
-    roughness: 0.28,
-    clearcoat: 0.35,
-    clearcoatRoughness: 0.4,
-    envMapIntensity: 1.15,
+    metalness: 0.7,
+    roughness: 0.42,
+    clearcoat: 0.12,
+    clearcoatRoughness: 0.55,
+    envMapIntensity: 0.2,
   });
   const faceTexA = plainFaceTex(palette);
   const faceTexB = plainFaceTex(palette);
+  // A softly emissive base keeps the face artwork readable when tilted, while
+  // the physical layer still lets the draggable softbox add visible light.
   const faceOpts = {
-    metalness: 0.55, roughness: 0.28,
-    clearcoat: 0.4, clearcoatRoughness: 0.35,
-    envMapIntensity: 1.1,
+    color: 0x222222,
+    metalness: 0, roughness: 1,
+    clearcoat: 0, clearcoatRoughness: 1,
+    envMapIntensity: 0,
+    emissive: 0xffffff, emissiveIntensity: 0.85,
   };
-  const fA = new THREE.MeshPhysicalMaterial({ ...faceOpts, map: faceTexA });
-  const fB = new THREE.MeshPhysicalMaterial({ ...faceOpts, map: faceTexB });
+  const fA = new THREE.MeshPhysicalMaterial({ ...faceOpts, map: faceTexA, emissiveMap: faceTexA });
+  const fB = new THREE.MeshPhysicalMaterial({ ...faceOpts, map: faceTexB, emissiveMap: faceTexB });
   const bodyGeo = new THREE.CylinderGeometry(1, 1, BASE_THICK, seg);
   const body = new THREE.Mesh(bodyGeo, [edgeMat, fA, fB]);
   const bevelGeo = new THREE.TorusGeometry(0.997, 0.022, 14, seg);
@@ -347,11 +351,13 @@ const DEFAULTS = {
   playing: true, rotSpeed: 0, dir: 1, orbitSpeed: 0.25,
   floatAmp: 0.16, floatSpeed: 0.55, tilt: 0,
   orbitR: 2.2, size: 0.6, thick: 0.13, overallScale: 0.7,
-  metalness: 0.85, roughness: 0.28,
-  light: 1, accent: 232, grid: true, autoOrbit: false,
-  rightLightX: 7, rightLightY: 3.5, rightLightZ: 6,
+  metalness: 0.35, roughness: 0.55,
+  // Zero is the natural studio base; the draggable light is an optional overlay.
+  light: 0, grid: true, autoOrbit: false,
+  // Keep the softbox outside the coin orbit for a natural studio-style key light.
+  rightLightX: 8, rightLightY: 7, rightLightZ: 10,
+  rightLightSoftness: 12,
   bgColor: "#ffffff",
-  rimColor: "#5b6bff",
   showRing: false, showShadow: false,
   glow: 0.4, glowRange: 1.6,
   naturalTilt: false, naturalTiltAmount: 0.35, naturalTiltWobble: 0.4,
@@ -513,36 +519,21 @@ export default function CoinStudio() {
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.1;
+    renderer.toneMappingExposure = 1;
     renderer.setClearColor(new THREE.Color(DEFAULTS.bgColor), 1);
     RectAreaLightUniformsLib.init();
-    // Image-based lighting — the reflections make metallic surfaces read as
-    // truly physical rather than plastic.
     const pmrem = new THREE.PMREMGenerator(renderer);
     mount.appendChild(renderer.domElement);
     renderer.domElement.style.display = "block";
     renderer.domElement.style.cursor = "grab";
 
+    // The face artwork carries its own stable natural brightness. The
+    // draggable softbox below is the only dynamic scene light.
     scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-
-    const amb = new THREE.AmbientLight(0xffffff, 0.55);
-    scene.add(amb);
-    const keyL = new THREE.DirectionalLight(0xffffff, 1.8);
-    keyL.position.set(-4, 6, 8);
-    scene.add(keyL);
-    const fill = new THREE.DirectionalLight(0xe6ecff, 0.5);
-    fill.position.set(6, -1, 5);
-    scene.add(fill);
-    // A broad softbox on the upper-right/front gives the coins a clean,
-    // studio-style highlight rather than a small, harsh point reflection.
-    const rightSoftbox = new THREE.RectAreaLight(0xffffff, 7.5, 6, 6);
-    rightSoftbox.position.set(7, 3.5, 6);
+    const rightSoftbox = new THREE.RectAreaLight(0xfffaf0, 10, 12, 12);
+    rightSoftbox.position.set(8, 7, 10);
     rightSoftbox.lookAt(0, 0, 0);
     scene.add(rightSoftbox);
-    const rimL = new THREE.PointLight(0x5b6bff, 2.2, 60);
-    rimL.position.set(-3, 3, -6); scene.add(rimL);
-    const rimL2 = new THREE.PointLight(0x8a5bff, 1.6, 60);
-    rimL2.position.set(6, -2, -4); scene.add(rimL2);
 
     const world = new THREE.Group();
     scene.add(world);
@@ -628,6 +619,7 @@ export default function CoinStudio() {
           const m = entry.faceMats[idx];
           if (m.map && m.map.dispose) m.map.dispose();
           m.map = t;
+          m.emissiveMap = t;
           m.needsUpdate = true;
         })
         .catch(() => { /* palette fallback */ });
@@ -714,26 +706,16 @@ export default function CoinStudio() {
       const bgAlpha = s.transparentBg ? 0 : 1;
       if (s.bgColor) renderer.setClearColor(new THREE.Color(s.bgColor), bgAlpha);
 
-      // Rim lights — a direct colour picker takes precedence over the accent hue.
-      let hue = s.accent / 360;
-      if (s.rimColor) {
-        const c = new THREE.Color(s.rimColor);
-        rimL.color.copy(c);
-        const hsl = { h: 0, s: 0, l: 0 };
-        c.getHSL(hsl);
-        hue = hsl.h;
-        rimL2.color.setHSL((hue + 0.08) % 1, hsl.s, hsl.l);
-      } else {
-        rimL.color.setHSL(hue, 0.8, 0.62);
-        rimL2.color.setHSL((hue + 0.08) % 1, 0.8, 0.6);
-      }
-      keyL.intensity = 1.8 * s.light;
-      amb.intensity = 0.55 * s.light;
-      rightSoftbox.intensity = 7.5 * s.light;
+      // Depth 0 turns off only the optional drag-light overlay; the neutral
+      // studio base remains visible underneath.
+      const dragLightOn = s.rightLightZ > 0;
+      // The visible Intensity control adjusts only the draggable softbox.
+      // The face base remains stable even when the coin is tilted.
+      rightSoftbox.intensity = dragLightOn ? 2.5 * s.light : 0;
       rightSoftbox.position.set(s.rightLightX, s.rightLightY, s.rightLightZ);
+      rightSoftbox.width = s.rightLightSoftness;
+      rightSoftbox.height = s.rightLightSoftness;
       rightSoftbox.lookAt(0, 0, 0);
-      rimL.intensity = 2.2 * s.light;
-      rimL2.intensity = 1.6 * s.light;
 
       const N = currentList.length;
       currentList.forEach((spec, i) => {
@@ -758,14 +740,30 @@ export default function CoinStudio() {
         entry.body.scale.y = yScale;
         entry.bevelA.position.y = s.thick / 2;
         entry.bevelB.position.y = -s.thick / 2;
-        // Halo — colour follows the accent hue, opacity is "glow", scale is "glowRange".
+        // Halo stays neutral and remains part of the base studio presentation.
         entry.halo.scale.setScalar(3 * s.glowRange);
         entry.haloMat.opacity = s.glow;
-        entry.haloMat.color.setHSL(hue, 0.75, 0.72);
+        entry.haloMat.color.setRGB(1, 1, 1);
         entry.shadow.visible = !!s.showShadow;
         entry.edgeMat.metalness = s.metalness;
         entry.edgeMat.roughness = s.roughness;
-        entry.faceMats.forEach((m) => { m.metalness = s.metalness; m.roughness = s.roughness; });
+        // Apply the drag light as a soft, position-based face overlay. It is
+        // independent of the coin normal, so dragging works without a tilt
+        // changing the face brightness.
+        const lightDistance = Math.hypot(
+          entry.floatG.position.x - s.rightLightX,
+          entry.floatG.position.y - s.rightLightY
+        );
+        const spread = Math.max(1, s.rightLightSoftness * 0.9);
+        const lightFalloff = Math.max(0, 1 - lightDistance / spread) ** 2;
+        const faceBoost = dragLightOn
+          ? Math.min(0.35, s.light * 0.2 * lightFalloff)
+          : 0;
+        entry.faceMats.forEach((m) => {
+          m.metalness = 0;
+          m.roughness = 1;
+          m.emissiveIntensity = 0.85 + faceBoost;
+        });
       });
 
       orbitRing.visible = !!s.showRing;
@@ -1041,7 +1039,7 @@ export default function CoinStudio() {
 
           <SectionLabel>Lighting</SectionLabel>
           <Row label="Intensity" value={ui.light.toFixed(2)}>
-            <Slider min={0.2} max={2} step={0.01} value={ui.light} onChange={(v) => set({ light: v })} />
+            <Slider min={0} max={4} step={0.01} value={ui.light} onChange={(v) => set({ light: v })} />
           </Row>
           <div className="mb-4 rounded-lg border border-slate-700 bg-slate-800/40 p-3">
             <div className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Right soft light</div>
@@ -1054,17 +1052,10 @@ export default function CoinStudio() {
             <Row label="Depth" value={ui.rightLightZ.toFixed(1)}>
               <Slider min={-10} max={10} step={0.1} value={ui.rightLightZ} onChange={(v) => set({ rightLightZ: v })} />
             </Row>
+            <Row label="Softness" value={ui.rightLightSoftness.toFixed(1)}>
+              <Slider min={1} max={20} step={0.1} value={ui.rightLightSoftness} onChange={(v) => set({ rightLightSoftness: v })} />
+            </Row>
           </div>
-          <Row label="Accent hue" value={Math.round(ui.accent) + "°"}>
-            <Slider min={0} max={360} step={1} value={ui.accent} onChange={(v) => set({ accent: v })} />
-          </Row>
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-[13px] font-medium text-slate-200">Rim colour</span>
-            <input type="color" value={ui.rimColor}
-              onChange={(e) => set({ rimColor: e.target.value })}
-              className="w-10 h-7 rounded border border-slate-700 bg-transparent cursor-pointer" />
-          </div>
-
           <SectionLabel>Scene</SectionLabel>
           <div className="flex items-center justify-between mb-3">
             <span className="text-[13px] font-medium text-slate-200">Dot grid</span>
@@ -1231,6 +1222,12 @@ export default function CoinStudio() {
             top: `${95 - ((ui.rightLightY + 10) / 20) * 90}%`,
             transform: "translate(-50%, -50%)",
           }}>
+          <span className="pointer-events-none absolute left-1/2 top-10 -translate-x-1/2 -translate-y-1/2 rounded-full border border-indigo-400/35 bg-indigo-300/5 transition-[width,height,opacity] duration-150"
+            style={{
+              width: `${Math.max(100, ui.rightLightSoftness * 24)}px`,
+              height: `${Math.max(100, ui.rightLightSoftness * 24)}px`,
+              opacity: ui.light > 0 ? Math.min(0.75, 0.2 + ui.light * 0.14) : 0.12,
+            }} />
           <button type="button"
             onPointerDown={beginStageLightDrag}
             onPointerUp={(event) => {
