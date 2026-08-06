@@ -297,18 +297,34 @@ const PALETTES = {
 };
 const PALETTE_KEYS = Object.keys(PALETTES);
 
-// Default face assets — drop the front/back images from your screenshot into
-// `public/images/coins/` and every new coin picks them up automatically.
-// If the files are missing, the coin falls back to its palette gradient.
-const DEFAULT_FRONT = "/images/coins/front.png";
-const DEFAULT_BACK  = "/images/coins/back.png";
-// Start with a complete, balanced orbit. Seven coins gives the hero enough
-// presence without making the individual faces feel crowded or cropped.
+// Default Nepal coin set. The four-face rhythm matches the supplied reference:
+// cow, then three map coins, with the mountain artwork on every reverse.
+const DEFAULT_COW_FRONT = "/images/coins/nepal-cow.png";
+const DEFAULT_MAP_FRONT = "/images/coins/nepal-map.jpg";
+const DEFAULT_BACK = "/images/coins/nepal-mountain.jpg";
+const DEFAULT_FRONTS = [
+  DEFAULT_COW_FRONT,
+  DEFAULT_MAP_FRONT,
+  DEFAULT_MAP_FRONT,
+  DEFAULT_MAP_FRONT,
+];
 const DEFAULT_COIN_COUNT = 10;
 
 const newId = () =>
   (typeof crypto !== "undefined" && crypto.randomUUID && crypto.randomUUID()) ||
   Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+const defaultFrontForIndex = (index) => DEFAULT_FRONTS[index % DEFAULT_FRONTS.length];
+const createDefaultCoin = (index) => ({
+  key: newId(),
+  palette: PALETTE_KEYS[index % PALETTE_KEYS.length],
+  front: defaultFrontForIndex(index),
+  back: DEFAULT_BACK,
+  phase: index * 1.2,
+  angleOffset: 0,
+});
+const createDefaultCoins = () =>
+  Array.from({ length: DEFAULT_COIN_COUNT }, (_, index) => createDefaultCoin(index));
 
 // =========================================================================
 //  UI PRIMITIVES
@@ -693,28 +709,10 @@ export default function CoinStudio() {
   }, [set, stageSize]);
 
   // Coin list — this is the source of truth.  Each entry is a "spec".
-  const [coins, setCoins] = useState(() =>
-    Array.from({ length: DEFAULT_COIN_COUNT }, (_, i) => ({
-      key: newId(),
-      palette: PALETTE_KEYS[i % PALETTE_KEYS.length],
-      front: DEFAULT_FRONT,
-      back: DEFAULT_BACK,
-      phase: i * 1.2,
-      angleOffset: 0,
-    }))
-  );
+  const [coins, setCoins] = useState(createDefaultCoins);
 
   const addCoin = useCallback(() => {
-    setCoins((cs) => [
-      ...cs,
-      {
-        key: newId(),
-        palette: PALETTE_KEYS[cs.length % PALETTE_KEYS.length],
-        front: DEFAULT_FRONT, back: DEFAULT_BACK,
-        phase: cs.length * 1.2,
-        angleOffset: 0,
-      },
-    ]);
+    setCoins((cs) => [...cs, createDefaultCoin(cs.length)]);
   }, []);
   const removeCoin = useCallback((key) => {
     setCoins((cs) => (cs.length > 1 ? cs.filter((c) => c.key !== key) : cs));
@@ -733,13 +731,7 @@ export default function CoinStudio() {
       if (n < cs.length) return cs.slice(0, n);
       const add = [];
       for (let i = cs.length; i < n; i++) {
-        add.push({
-          key: newId(),
-          palette: PALETTE_KEYS[i % PALETTE_KEYS.length],
-          front: DEFAULT_FRONT,
-          back: DEFAULT_BACK,
-          phase: i * 1.2,
-        });
+        add.push(createDefaultCoin(i));
       }
       return [...cs, ...add];
     });
@@ -757,6 +749,7 @@ export default function CoinStudio() {
   const reset = useCallback(() => {
     settings.current = { ...DEFAULTS };
     setUi({ ...DEFAULTS });
+    setCoins(createDefaultCoins());
     api.current && api.current.resetOrbit();
   }, []);
 
