@@ -215,6 +215,21 @@ function shadowTex() {
 }
 
 // =========================================================================
+//  PATH & EASING HELPERS
+// =========================================================================
+// Universal easing applied to a normalized loop parameter t ∈ [0, 1). Ease
+// functions preserve f(0)=0 and f(1)=1 so a looping animation stays continuous.
+function easeFn(t, mode, k = 2) {
+  switch (mode) {
+    case "in":    return Math.pow(t, k);
+    case "out":   return 1 - Math.pow(1 - t, k);
+    case "inout": return t < 0.5
+      ? 0.5 * Math.pow(2 * t, k)
+      : 1 - 0.5 * Math.pow(2 - 2 * t, k);
+    default:      return t;
+  }
+}
+// =========================================================================
 //  COIN MESH (thick body + reeded rim + bevel rings on both edges)
 // =========================================================================
 const BASE_THICK = 0.22;
@@ -243,10 +258,20 @@ function buildCoinMeshes(palette) {
     envMapIntensity: 0,
     emissive: 0xffffff, emissiveIntensity: 0.85,
   };
-  const fA = new THREE.MeshPhysicalMaterial({ ...faceOpts, map: faceTexA, emissiveMap: faceTexA });
-  const fB = new THREE.MeshPhysicalMaterial({ ...faceOpts, map: faceTexB, emissiveMap: faceTexB });
-  const bodyGeo = new THREE.CylinderGeometry(1, 1, BASE_THICK, seg);
-  const body = new THREE.Mesh(bodyGeo, [edgeMat, fA, fB]);
+  const fA = new THREE.MeshPhysicalMaterial({ ...faceOpts, map: faceTexA, emissiveMap: faceTexA, side: THREE.FrontSide });
+  const fB = new THREE.MeshPhysicalMaterial({ ...faceOpts, map: faceTexB, emissiveMap: faceTexB, side: THREE.FrontSide });
+  // Body split: an open-ended cylinder for the reeded edge + two disc caps for
+  // the faces. Separate meshes let us give front/back independent renderOrder
+  // so a "Face priority" control can pick which side wins visual collisions.
+  const edgeGeo = new THREE.CylinderGeometry(1, 1, BASE_THICK, seg, 1, true);
+  const body = new THREE.Mesh(edgeGeo, edgeMat);
+  const capGeo = new THREE.CircleGeometry(1, seg);
+  const faceFront = new THREE.Mesh(capGeo, fA);
+  faceFront.rotation.x = -Math.PI / 2;
+  faceFront.position.y = BASE_THICK / 2 + 0.0001;
+  const faceBack = new THREE.Mesh(capGeo.clone(), fB);
+  faceBack.rotation.x = Math.PI / 2;
+  faceBack.position.y = -BASE_THICK / 2 - 0.0001;
   const bevelGeo = new THREE.TorusGeometry(0.997, 0.022, 14, seg);
   const bevelA = new THREE.Mesh(bevelGeo, edgeMat);
   bevelA.rotation.x = Math.PI / 2;
@@ -255,9 +280,9 @@ function buildCoinMeshes(palette) {
   bevelB.rotation.x = Math.PI / 2;
   bevelB.position.y = -BASE_THICK / 2;
   const coin = new THREE.Group();
-  coin.add(body, bevelA, bevelB);
+  coin.add(body, faceFront, faceBack, bevelA, bevelB);
   coin.rotation.x = Math.PI / 2;
-  return { coin, body, bevelA, bevelB, edgeMat, faceMats: [fA, fB] };
+  return { coin, body, faceFront, faceBack, bevelA, bevelB, edgeMat, faceMats: [fA, fB] };
 }
 
 // =========================================================================
@@ -279,7 +304,7 @@ const DEFAULT_FRONT = "/images/coins/front.png";
 const DEFAULT_BACK  = "/images/coins/back.png";
 // Start with a complete, balanced orbit. Seven coins gives the hero enough
 // presence without making the individual faces feel crowded or cropped.
-const DEFAULT_COIN_COUNT = 9;
+const DEFAULT_COIN_COUNT = 10;
 
 const newId = () =>
   (typeof crypto !== "undefined" && crypto.randomUUID && crypto.randomUUID()) ||
@@ -288,22 +313,76 @@ const newId = () =>
 // =========================================================================
 //  UI PRIMITIVES
 // =========================================================================
-const Row = ({ label, value, children }) => (
-  <div className="mb-4">
-    <div className="flex items-center justify-between mb-2">
-      <span className="text-[13px] font-medium text-slate-200">{label}</span>
-      {value !== undefined && (
-        <span className="text-[12px] tabular-nums text-slate-400 font-mono">{value}</span>
-      )}
+// Row: stacked label above, slider/control below (per component rules — no
+// side-label form). Optional `unit` suffix uses the compact-vs-spaced format:
+// %, px, °, s, ms, fps render tight; longer word units render with a space.
+const COMPACT_UNITS = new Set(["%", "px", "°", "s", "ms", "fps", "deg"]);
+const Row = ({ label, value, unit, children }) => {
+  let display = value;
+  if (value !== undefined && unit) {
+    const compact = COMPACT_UNITS.has(unit);
+    display = `${value}${compact ? unit : ` ${unit}`}`;
+  }
+  return (
+    <div className="mb-3">
+      <div className="flex items-center justify-between mb-1.5">
+        <span className="text-[11.5px] font-medium text-slate-200">{label}</span>
+        {display !== undefined && (
+          <span className="text-[11px] tabular-nums text-slate-400 font-mono">{display}</span>
+        )}
+      </div>
+      {children}
     </div>
-    {children}
-  </div>
-);
+  );
+};
+// Shared WebAudio context — plays a soft tick each time a slider steps.
+// One AudioContext lives for the app lifetime; short envelopes prevent build-up.
+let __audioCtx = null;
+const getAudioCtx = () => {
+  if (typeof window === "undefined") return null;
+  if (!__audioCtx) {
+    try { __audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
+    catch { return null; }
+  }
+  if (__audioCtx.state === "suspended") __audioCtx.resume().catch(() => {});
+  return __audioCtx;
+};
+const playTick = (pct) => {
+  const ctx = getAudioCtx();
+  if (!ctx) return;
+  const t = ctx.currentTime;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  // Frequency rides the slider position so higher values → higher pitch.
+  const freq = 520 + Math.max(0, Math.min(1, pct)) * 380;
+  osc.type = "sine";
+  osc.frequency.setValueAtTime(freq, t);
+  gain.gain.setValueAtTime(0, t);
+  gain.gain.linearRampToValueAtTime(0.045, t + 0.003);
+  gain.gain.exponentialRampToValueAtTime(0.0005, t + 0.055);
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(t);
+  osc.stop(t + 0.07);
+  // Light haptic tap on devices that support it.
+  if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(6);
+};
+
 const Slider = ({ min, max, step, value, onChange }) => {
   const pct = ((value - min) / (max - min)) * 100;
+  const lastPlayed = useRef(0);
+  const handleChange = (e) => {
+    const v = parseFloat(e.target.value);
+    const now = performance.now();
+    // Throttle audio to avoid an aggressive buzz — one tick per ~28ms.
+    if (now - lastPlayed.current > 28) {
+      playTick((v - min) / (max - min));
+      lastPlayed.current = now;
+    }
+    onChange(v);
+  };
   return (
     <input type="range" min={min} max={max} step={step} value={value}
-      onChange={(e) => onChange(parseFloat(e.target.value))}
+      onChange={handleChange}
       className="cs-slider" style={{ "--pct": pct + "%" }} />
   );
 };
@@ -313,22 +392,109 @@ const Switch = ({ checked, onChange }) => (
     <span className="cs-knob" />
   </button>
 );
+// shadcn-style Tabs (30% smaller). Muted container, active pill swaps to
+// foreground/background with a subtle shadow.
 const Segment = ({ options, value, onChange }) => (
-  <div className="flex gap-1 p-1 rounded-lg bg-slate-800/70 border border-slate-700">
+  <div className="inline-flex w-full h-6 p-0.5 rounded bg-slate-800/70 border border-slate-700/70">
     {options.map((o) => (
       <button key={o.v} onClick={() => onChange(o.v)}
-        className={"flex-1 text-[12px] font-medium py-1.5 rounded-md transition-colors " +
-          (value === o.v ? "bg-indigo-500 text-white shadow" : "text-slate-300 hover:bg-slate-700/60")}>
+        className={"flex-1 inline-flex items-center justify-center h-5 px-1.5 rounded-sm " +
+          "text-[10.5px] font-medium transition-colors " +
+          (value === o.v
+            ? "bg-slate-100 text-slate-900 shadow-sm"
+            : "text-slate-400 hover:text-slate-100")}>
         {o.l}
       </button>
     ))}
   </div>
 );
 const SectionLabel = ({ children }) => (
-  <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-500 mt-6 mb-3 first:mt-0">
+  <div className="text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-500 mt-5 mb-2.5 first:mt-0">
     {children}
   </div>
 );
+// Collapsible section (kept for Effects) — shadcn-flavored heading + chevron.
+const Collapsible = ({ title, defaultOpen = true, children }) => {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="border-t border-slate-800/60 first:border-t-0">
+      <button onClick={() => setOpen(!open)}
+        className="w-full flex items-center justify-between py-3 text-left">
+        <div className="text-[12px] font-semibold text-slate-100 tracking-tight">{title}</div>
+        <span className={"text-slate-500 text-base leading-none transition-transform duration-150 " +
+          (open ? "" : "-rotate-90")}>⌄</span>
+      </button>
+      {open && <div className="pb-3">{children}</div>}
+    </div>
+  );
+};
+// Always-open section header — sits above content, no toggle.
+const PanelHeader = ({ title }) => (
+  <div className="pt-3 pb-2 border-t border-slate-800/60 first:border-t-0 mt-2 first:mt-0">
+    <div className="text-[12px] font-semibold text-slate-100 tracking-tight">{title}</div>
+  </div>
+);
+// shadcn-style compact button (30% smaller than default). Ghost/outline until
+// active, uses ring treatment for the active state instead of a color fill.
+const Chip = ({ active, onClick, children }) => (
+  <button onClick={onClick}
+    className={"inline-flex items-center h-5 px-2 rounded text-[10.5px] font-medium " +
+      "transition-colors border focus:outline-none focus-visible:ring-1 focus-visible:ring-slate-400 " +
+      (active
+        ? "bg-slate-100 text-slate-900 border-slate-100"
+        : "bg-transparent text-slate-300 border-slate-700 hover:bg-slate-800 hover:text-slate-50")}>
+    {children}
+  </button>
+);
+const ChipRow = ({ children }) => (
+  <div className="flex flex-wrap gap-1.5 mb-2.5">{children}</div>
+);
+// Grouped dropdown select — mirrors the modern editor "Mode / Blend" picker:
+// current value shown as a pill button, click opens a scrollable panel with
+// section headings and a checkmark on the active row.
+const DropdownSelect = ({ value, onChange, groups, placeholder = "Select" }) => {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e) => { if (!ref.current?.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+  let currentLabel = placeholder;
+  for (const g of groups) for (const item of g.items) if (item.v === value) currentLabel = item.l;
+  return (
+    <div ref={ref} className="relative">
+      <button onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center justify-between h-6 px-2 rounded bg-transparent border border-slate-700 text-slate-100 text-[10.5px] font-medium hover:bg-slate-800 transition-colors">
+        <span>{currentLabel}</span>
+        <span className={"text-slate-500 text-[10px] leading-none transition-transform duration-150 " + (open ? "rotate-180" : "")}>⌄</span>
+      </button>
+      {open && (
+        <div className="absolute left-0 right-0 top-full mt-1 z-50 rounded-md bg-slate-950 border border-slate-800 shadow-xl max-h-72 overflow-y-auto cs-panel py-1">
+          {groups.map((g, gi) => (
+            <div key={gi}>
+              {g.label && (
+                <div className="px-2.5 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+                  {g.label}
+                </div>
+              )}
+              {g.items.map((item) => (
+                <button key={item.v}
+                  onClick={() => { onChange(item.v); setOpen(false); }}
+                  className={"w-full flex items-center gap-2 pl-2 pr-2.5 py-1 text-[10.5px] font-medium text-left hover:bg-slate-800 " +
+                    (value === item.v ? "text-white" : "text-slate-300")}>
+                  <span className={"w-3 text-[10px] " + (value === item.v ? "text-slate-100" : "text-transparent")}>✓</span>
+                  <span>{item.l}</span>
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
 
 // =========================================================================
 //  UTILITIES
@@ -356,6 +522,10 @@ const DEFAULTS = {
   orbitR: 2.3, size: 0.54, thick: 0.14, overallScale: 1.27,
   metalness: 0.48, roughness: 0.55,
   light: 1.4, grid: false, autoOrbit: false,
+  // Face reflection controls — visibility (opacity) + softness (blur) of the
+  // specular highlight the drag light paints on the coin face. Coin texture
+  // itself is untouched; only the highlight responds.
+  reflectionOpacity: 0.55, reflectionBlur: 0.35,
   rightLightX: 7.9, rightLightY: 7.1, rightLightZ: 10,
   rightLightSoftness: 12,
   bgColor: "#ffffff",
@@ -365,6 +535,12 @@ const DEFAULTS = {
   perspectiveMode: "perspective", perspectiveIntensity: 0.3,
   scatterEnabled: false, scatterAmount: 0.5,
   coinOrder: "asc",
+  easing: "linear", easingStrength: 2,
+  coinLayering: "auto",
+  // Post-processing (CSS + tone-mapping based — no shader pipeline needed)
+  toneMap: "none", toneExposure: 1, stylePreset: "none",
+  fxBlur: 0, fxGrain: 0, fxVignette: 0, fxSaturation: 1, fxContrast: 1, fxBloom: 0,
+  fxHue: 0,
   transparentBg: false,
   exportDuration: 5, exportFps: 30, exportBitrate: 60, exportGifQuality: 10,
   exportPreset: "square4k",
@@ -612,16 +788,24 @@ export default function CoinStudio() {
 
     // The face artwork carries its own stable natural brightness. The
     // draggable softbox below is the only dynamic scene light.
-    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-    const rightSoftbox = new THREE.RectAreaLight(0xfffaf0, 10, 12, 12);
+    // Studio HDR-style environment — this is the primary source of soft light
+    // on the coin faces. Higher sigma (blur) gives a wrap-around ambient.
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.25).texture;
+    // Draggable key softbox — huge emitter and lower peak intensity so
+    // Lambertian shading spreads over a broad gradient instead of a hard wedge.
+    const rightSoftbox = new THREE.RectAreaLight(0xfff4dc, 4, 22, 22);
     rightSoftbox.position.set(8, 7, 10);
     rightSoftbox.lookAt(0, 0, 0);
     scene.add(rightSoftbox);
-    // Gentle hemisphere fill blends the shard-like specular the RectAreaLight
-    // otherwise leaves on the metallic edges — sky wash from above, warm floor
-    // bounce from below.
-    const fill = new THREE.HemisphereLight(0xf5f2ff, 0xfff3e0, 0.55);
+    // Wrap fills (sky + warm floor) — strong enough to lift the shadow side so
+    // the transition on tilted coins reads smooth, not clipped.
+    const fill = new THREE.HemisphereLight(0xf5f2ff, 0xfff3e0, 1.4);
     scene.add(fill);
+    // Rim / kicker from opposite side — subtle backlight that separates coin
+    // silhouettes from the background, standard 3-point studio move.
+    const rim = new THREE.DirectionalLight(0xffffff, 0.35);
+    rim.position.set(-6, 4, -4);
+    scene.add(rim);
 
     const world = new THREE.Group();
     scene.add(world);
@@ -638,6 +822,7 @@ export default function CoinStudio() {
     const haloMap = haloTex();
     const registry = new Map(); // key -> entry
     let currentList = [];
+
 
     const buildEntry = (spec) => {
       const pal = PALETTES[spec.palette] || PALETTES.sage;
@@ -674,6 +859,7 @@ export default function CoinStudio() {
       return {
         floatG, tilt, spin,
         coin: built.coin, body: built.body,
+        faceFront: built.faceFront, faceBack: built.faceBack,
         bevelA: built.bevelA, bevelB: built.bevelB,
         faceMats: built.faceMats, edgeMat: built.edgeMat,
         halo, haloMat, shadow,
@@ -812,18 +998,31 @@ export default function CoinStudio() {
       fitCamera();
       const bgAlpha = s.transparentBg ? 0 : 1;
       if (s.bgColor) renderer.setClearColor(new THREE.Color(s.bgColor), bgAlpha);
+      // Tonemap + exposure — real three.js knobs, changes bake into the render.
+      const tmMap = {
+        none:     THREE.NoToneMapping,
+        linear:   THREE.LinearToneMapping,
+        reinhard: THREE.ReinhardToneMapping,
+        cineon:   THREE.CineonToneMapping,
+        aces:     THREE.ACESFilmicToneMapping,
+        agx:      THREE.AgXToneMapping ?? THREE.ACESFilmicToneMapping,
+      };
+      const tm = tmMap[s.toneMap] ?? THREE.ACESFilmicToneMapping;
+      if (renderer.toneMapping !== tm) renderer.toneMapping = tm;
+      renderer.toneMappingExposure = s.toneExposure;
 
       // Depth 0 turns off only the optional drag-light overlay; the neutral
       // studio base remains visible underneath.
       const dragLightOn = s.rightLightZ > 0;
       // The visible Intensity control adjusts only the draggable softbox.
       // The face base remains stable even when the coin is tilted.
-      rightSoftbox.intensity = dragLightOn ? 2.5 * s.light : 0;
+      // Lower intensity coefficient (studio softbox is broad, not punchy).
+      rightSoftbox.intensity = dragLightOn ? 1.1 * s.light : 0;
       rightSoftbox.position.set(s.rightLightX, s.rightLightY, s.rightLightZ);
-      // Enlarge the emitter beyond the softness UI value so the specular on
-      // metallic edges blurs into a soft wash instead of a sharp shard.
-      rightSoftbox.width = s.rightLightSoftness * 2.2;
-      rightSoftbox.height = s.rightLightSoftness * 2.2;
+      // Really large emitter — a big softbox at close range gives that
+      // wrap-around, gradient studio look instead of a directional wedge.
+      rightSoftbox.width = s.rightLightSoftness * 3.5;
+      rightSoftbox.height = s.rightLightSoftness * 3.5;
       rightSoftbox.lookAt(0, 0, 0);
 
       const N = currentList.length;
@@ -849,11 +1048,30 @@ export default function CoinStudio() {
         const scatterA = s.scatterEnabled ? entry.scatterAngle * s.scatterAmount * 1.6 : 0;
         const scatterR = s.scatterEnabled ? entry.scatterRadius * s.scatterAmount * s.orbitR : 0;
         const orderIdx = s.coinOrder === "desc" ? (N - 1 - i) : i;
-        const orbitA = (orderIdx / N) * Math.PI * 2 + ft * s.orbitSpeed * s.dir - Math.PI / 2 + scatterA + (entry.angleOffset || 0);
+        // Normalized loop parameter — same value drives circle angle and
+        // curve parameter, so easing behaves the same across modes.
+        const rawT = (
+          (orderIdx / N)
+          + (ft * s.orbitSpeed * s.dir) / (Math.PI * 2)
+          + (scatterA + (entry.angleOffset || 0)) / (Math.PI * 2)
+        );
+        let tParam = rawT - Math.floor(rawT);
+        const et = easeFn(tParam, s.easing, s.easingStrength);
         const radius = s.orbitR + scatterR;
+        const orbitA = et * Math.PI * 2 - Math.PI / 2;
         entry.floatG.position.x = Math.cos(orbitA) * radius;
         entry.floatG.position.y = Math.sin(orbitA) * radius
           + Math.sin(ft * s.floatSpeed + entry.phase) * s.floatAmp;
+        // Coin layering: nudge each coin's Z so overlapping neighbours don't
+        // cut through each other. "first" = index 0 on top; "last" = last on
+        // top; "auto" defers to real 3D depth (behaviour before this control).
+        if (s.coinLayering === "first") {
+          entry.floatG.position.z = (N - 1 - i) * 0.02;
+        } else if (s.coinLayering === "last") {
+          entry.floatG.position.z = i * 0.02;
+        } else {
+          entry.floatG.position.z = 0;
+        }
         entry.tilt.rotation.x = 0.14 + s.tilt;
         entry.floatG.scale.setScalar(s.size);
         // Dynamic thickness — scale the cylinder in local Y and shift the
@@ -869,24 +1087,17 @@ export default function CoinStudio() {
         entry.shadow.visible = !!s.showShadow;
         entry.edgeMat.metalness = s.metalness;
         entry.edgeMat.roughness = s.roughness;
-        // Apply the drag light as a soft, position-based face overlay. It is
-        // independent of the coin normal, so dragging works without a tilt
-        // changing the face brightness.
-        const lightDistance = Math.hypot(
-          entry.floatG.position.x - s.rightLightX,
-          entry.floatG.position.y - s.rightLightY
-        );
-        // Localized falloff: tighter spread so the coin closest to the drag
-        // light visibly brightens instead of the whole ring lifting slightly.
-        const spread = Math.max(3, s.rightLightSoftness * 0.9);
-        const lightFalloff = Math.max(0, 1 - lightDistance / spread) ** 1.5;
-        const faceBoost = dragLightOn
-          ? Math.min(1.8, s.light * 0.7 * lightFalloff)
-          : 0;
+        // Reflection Opacity → face metalness (brighter specular highlight).
+        // Reflection Blur → roughness (0.2 sharp glint … 1.0 fully diffuse).
+        // Emissive is fixed so the coin artwork itself never changes brightness
+        // — only the highlight/reflection responds to the sliders.
+        const refl = Math.max(0, Math.min(1, s.reflectionOpacity ?? 0));
+        const blur = Math.max(0, Math.min(1, s.reflectionBlur ?? 0));
         entry.faceMats.forEach((m) => {
-          m.metalness = 0;
-          m.roughness = 1;
-          m.emissiveIntensity = 0.85 + faceBoost;
+          m.metalness = refl * 0.7;
+          m.roughness = 0.2 + blur * 0.8;
+          m.envMapIntensity = 0.6 + refl * 0.8;
+          m.emissiveIntensity = 0.85;
         });
       });
 
@@ -1071,6 +1282,37 @@ export default function CoinStudio() {
     }
   };
 
+  // Post-processing effect application — driven by CSS filter on the canvas
+  // and overlay layers on the stage (grain SVG noise + vignette radial mask).
+  const canvasFilter = [
+    ui.fxBlur > 0 ? `blur(${ui.fxBlur.toFixed(2)}px)` : null,
+    ui.fxSaturation !== 1 ? `saturate(${ui.fxSaturation.toFixed(2)})` : null,
+    ui.fxContrast !== 1 ? `contrast(${ui.fxContrast.toFixed(2)})` : null,
+    ui.fxHue !== 0 ? `hue-rotate(${ui.fxHue}deg)` : null,
+    ui.fxBloom > 0 ? `drop-shadow(0 0 ${(ui.fxBloom * 20).toFixed(1)}px rgba(255,240,220,${(ui.fxBloom * 0.6).toFixed(2)}))` : null,
+  ].filter(Boolean).join(" ");
+
+  // Style presets — bundle several post-processing values for one-tap looks.
+  const applyStyle = (preset) => {
+    const p = {
+      none:  { fxBlur: 0, fxGrain: 0, fxVignette: 0, fxSaturation: 1, fxContrast: 1, fxBloom: 0, fxHue: 0 },
+      glow:  { fxBloom: 0.6, fxSaturation: 1.1, fxContrast: 1.05, fxVignette: 0.15 },
+      haze:  { fxBlur: 0.6, fxBloom: 0.3, fxSaturation: 0.85, fxContrast: 0.95, fxGrain: 0.1 },
+      aura:  { fxBloom: 0.9, fxSaturation: 1.2, fxContrast: 1.08, fxVignette: 0.25 },
+      deep:  { fxContrast: 1.25, fxSaturation: 1.1, fxVignette: 0.5, fxGrain: 0.06 },
+      shadow:{ fxContrast: 1.35, fxSaturation: 0.9, fxVignette: 0.65 },
+      rich:  { fxSaturation: 1.35, fxContrast: 1.1, fxBloom: 0.25, fxVignette: 0.2 },
+      punch: { fxSaturation: 1.5, fxContrast: 1.3, fxBloom: 0.15 },
+      silk:  { fxBlur: 0.3, fxSaturation: 1.05, fxContrast: 0.98, fxBloom: 0.35 },
+      vivid: { fxSaturation: 1.6, fxContrast: 1.15, fxBloom: 0.2 },
+      neon:  { fxSaturation: 1.5, fxBloom: 0.9, fxContrast: 1.15, fxHue: 8 },
+      vhs:   { fxGrain: 0.35, fxContrast: 1.1, fxSaturation: 1.15, fxHue: -6 },
+      film:  { fxGrain: 0.25, fxContrast: 1.15, fxSaturation: 0.95, fxVignette: 0.35 },
+      dream: { fxBlur: 0.8, fxBloom: 0.5, fxSaturation: 1.05, fxVignette: 0.1 },
+    }[preset] || {};
+    set({ ...p, stylePreset: preset });
+  };
+
   // -------------------------------------------------------------------- STYLE
   const gridStyle = ui.grid
     ? {
@@ -1083,47 +1325,148 @@ export default function CoinStudio() {
     : {};
 
   return (
-    <div className="w-full h-screen flex bg-slate-950 text-slate-100 font-sans overflow-hidden">
+    <div className="cs-root w-full h-screen flex bg-slate-950 text-slate-100 overflow-hidden">
       <style>{`
-        .cs-slider{-webkit-appearance:none;appearance:none;width:100%;height:6px;border-radius:9999px;
-          background:linear-gradient(to right,#6366f1 var(--pct),#334155 var(--pct));outline:none;cursor:pointer;}
-        .cs-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:9999px;
-          background:#fff;border:2px solid #6366f1;box-shadow:0 1px 4px rgba(0,0,0,.4);cursor:pointer;transition:transform .1s;}
-        .cs-slider::-webkit-slider-thumb:hover{transform:scale(1.15);}
-        .cs-slider::-moz-range-thumb{width:16px;height:16px;border-radius:9999px;background:#fff;border:2px solid #6366f1;cursor:pointer;}
-        .cs-switch{position:relative;width:40px;height:22px;border-radius:9999px;transition:background .2s;flex:none;}
-        .cs-switch-on{background:#6366f1;} .cs-switch-off{background:#475569;}
-        .cs-knob{position:absolute;top:2px;left:2px;width:18px;height:18px;border-radius:9999px;background:#fff;
+        @import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500&display=swap');
+        .cs-root, .cs-root * { font-family: 'Geist', ui-sans-serif, system-ui, -apple-system, sans-serif; font-weight:400; }
+        /* Weight discipline: only 400 (regular) and 500 (medium) — no bolds. */
+        .cs-root .font-medium, .cs-root .font-semibold, .cs-root .font-bold, .cs-root b, .cs-root strong { font-weight:500; }
+        /* Minimal pill-fill slider — neutrals only */
+        .cs-slider{-webkit-appearance:none;appearance:none;width:100%;height:10px;border-radius:9999px;
+          background:linear-gradient(to right,#64748b var(--pct),rgba(30,41,59,0.85) var(--pct));
+          outline:none;cursor:ew-resize;transition:filter .15s;
+          box-shadow:inset 0 1px 2px rgba(0,0,0,0.35);}
+        .cs-slider:hover{filter:brightness(1.15);}
+        .cs-slider:active{filter:brightness(1.25);}
+        .cs-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:2px;height:10px;
+          background:transparent;border:0;cursor:ew-resize;}
+        .cs-slider::-moz-range-thumb{width:2px;height:10px;background:transparent;border:0;cursor:ew-resize;}
+        .cs-switch{position:relative;width:36px;height:20px;border-radius:9999px;transition:background .2s;flex:none;}
+        .cs-switch-on{background:#94a3b8;}
+        .cs-switch-off{background:#334155;}
+        .cs-knob{position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:9999px;background:#fff;
           transition:transform .2s;box-shadow:0 1px 3px rgba(0,0,0,.4);}
-        .cs-switch-on .cs-knob{transform:translateX(18px);}
-        .cs-panel::-webkit-scrollbar{width:8px;} .cs-panel::-webkit-scrollbar-thumb{background:#334155;border-radius:4px;}
+        .cs-switch-on .cs-knob{transform:translateX(16px);}
+        .cs-panel::-webkit-scrollbar{width:6px;}
+        .cs-panel::-webkit-scrollbar-thumb{background:#1e293b;border-radius:9999px;}
+        .cs-panel::-webkit-scrollbar-thumb:hover{background:#334155;}
         .cs-panel::-webkit-scrollbar-track{background:transparent;}
       `}</style>
 
       {/* CONTROL PANEL */}
       <aside className="w-[300px] flex-none h-full border-r border-slate-800 bg-slate-900/80 backdrop-blur flex flex-col">
-        <div className="px-5 py-4 border-b border-slate-800 flex items-center gap-2">
-          <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-indigo-400 to-violet-600 flex items-center justify-center text-[13px] font-bold">◈</div>
+        <div className="px-4 py-3 border-b border-slate-800 flex items-center gap-2">
+          <div className="w-6 h-6 rounded-md bg-gradient-to-br from-indigo-400 to-violet-600 flex items-center justify-center text-[11px] font-bold">◈</div>
           <div>
-            <h1 className="text-[15px] font-semibold leading-tight">Coin Studio</h1>
-            <p className="text-[11px] text-slate-500 leading-tight">Circular hero · 3D animator</p>
+            <h1 className="text-[14px] font-semibold leading-tight">Coin Studio</h1>
+            <p className="text-[10px] text-slate-500 leading-tight">Circular hero · 3D animator</p>
           </div>
         </div>
 
-        <div className="cs-panel flex-1 overflow-y-auto px-5 py-4">
+        <div className="cs-panel flex-1 overflow-y-auto px-4 py-3">
+          <PanelHeader title="Style presets" />
+          <div className="mb-4">
+            <DropdownSelect
+              value={ui.stylePreset}
+              onChange={(v) => applyStyle(v)}
+              groups={[
+                { label: "Base", items: [{ v: "none", l: "None" }] },
+                { label: "Soft", items: [
+                  { v: "glow",  l: "Glow" },
+                  { v: "haze",  l: "Haze" },
+                  { v: "silk",  l: "Silk" },
+                  { v: "dream", l: "Dream" },
+                ]},
+                { label: "Bold", items: [
+                  { v: "punch", l: "Punch" },
+                  { v: "vivid", l: "Vivid" },
+                  { v: "rich",  l: "Rich" },
+                  { v: "neon",  l: "Neon" },
+                  { v: "aura",  l: "Aura" },
+                ]},
+                { label: "Cinematic", items: [
+                  { v: "deep",   l: "Deep" },
+                  { v: "shadow", l: "Shadow" },
+                  { v: "film",   l: "Film" },
+                  { v: "vhs",    l: "VHS" },
+                ]},
+              ]}
+            />
+          </div>
+
+          <PanelHeader title="Tonemap" />
+          <div className="mb-3">
+            <DropdownSelect
+              value={ui.toneMap}
+              onChange={(v) => set({ toneMap: v })}
+              groups={[
+                { label: "Cinematic", items: [
+                  { v: "aces",   l: "ACES (Cinematic)" },
+                  { v: "cineon", l: "Filmic (S-Curve)" },
+                ]},
+                { label: "Soft", items: [
+                  { v: "reinhard", l: "Reinhard (Soft)" },
+                  { v: "agx",      l: "AgX (Neutral)" },
+                ]},
+                { label: "Direct", items: [
+                  { v: "linear", l: "Linear" },
+                  { v: "none",   l: "None" },
+                ]},
+              ]}
+            />
+          </div>
+          <Row label="Exposure" value={ui.toneExposure.toFixed(2)}>
+            <Slider min={0.2} max={3} step={0.01} value={ui.toneExposure}
+              onChange={(v) => set({ toneExposure: v })} />
+          </Row>
+
+          <Collapsible
+            title="Effects"
+            defaultOpen={false}
+          >
+            <Row label="Blur" value={ui.fxBlur.toFixed(1)} unit="px">
+              <Slider min={0} max={8} step={0.1} value={ui.fxBlur}
+                onChange={(v) => set({ fxBlur: v })} />
+            </Row>
+            <Row label="Grain" value={Math.round(ui.fxGrain * 100)} unit="%">
+              <Slider min={0} max={1} step={0.01} value={ui.fxGrain}
+                onChange={(v) => set({ fxGrain: v })} />
+            </Row>
+            <Row label="Vignette" value={Math.round(ui.fxVignette * 100)} unit="%">
+              <Slider min={0} max={1} step={0.01} value={ui.fxVignette}
+                onChange={(v) => set({ fxVignette: v })} />
+            </Row>
+            <Row label="Bloom" value={Math.round(ui.fxBloom * 100)} unit="%">
+              <Slider min={0} max={1.5} step={0.01} value={ui.fxBloom}
+                onChange={(v) => set({ fxBloom: v })} />
+            </Row>
+            <Row label="Saturation" value={ui.fxSaturation.toFixed(2)}>
+              <Slider min={0} max={2} step={0.01} value={ui.fxSaturation}
+                onChange={(v) => set({ fxSaturation: v })} />
+            </Row>
+            <Row label="Contrast" value={ui.fxContrast.toFixed(2)}>
+              <Slider min={0.5} max={2} step={0.01} value={ui.fxContrast}
+                onChange={(v) => set({ fxContrast: v })} />
+            </Row>
+            <Row label="Hue" value={ui.fxHue} unit="°">
+              <Slider min={-180} max={180} step={1} value={ui.fxHue}
+                onChange={(v) => set({ fxHue: v })} />
+            </Row>
+          </Collapsible>
+
           <SectionLabel>Playback</SectionLabel>
           <div className="flex gap-2 mb-2">
             <button onClick={() => set({ playing: !ui.playing })}
-              className="flex-1 py-2 rounded-lg bg-indigo-500 hover:bg-indigo-400 text-white text-[13px] font-medium transition-colors">
+              className="flex-1 h-7 inline-flex items-center justify-center rounded-md bg-slate-100 hover:bg-white text-slate-900 text-[11px] font-medium transition-colors">
               {ui.playing ? "❙❙  Pause" : "▶  Play"}
             </button>
             <button onClick={reset}
-              className="px-4 py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-200 text-[13px] font-medium transition-colors">
+              className="h-7 px-3 rounded-md border border-slate-700 hover:bg-slate-800 text-slate-200 text-[11px] font-medium transition-colors">
               Reset
             </button>
           </div>
           <button onClick={() => api.current && api.current.resetOrbit()}
-            className="w-full py-2 mb-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-300 text-[12px] font-medium">
+            className="w-full h-7 mb-2 rounded-md border border-slate-700 hover:bg-slate-800 text-slate-300 text-[10.5px] font-medium">
             Reset view (recenter ring)
           </button>
 
@@ -1138,10 +1481,10 @@ export default function CoinStudio() {
             <Slider min={0} max={2} step={0.01} value={ui.orbitSpeed} onChange={(v) => set({ orbitSpeed: v })} />
           </Row>
 
-          <SectionLabel>Perspective</SectionLabel>
+          <Collapsible title="Perspective">
           <Row label="Mode">
             <Segment
-              options={[{ v: "ring", l: "Ring" }, { v: "perspective", l: "Perspective" }]}
+              options={[{ v: "ring", l: "Ring" }, { v: "perspective", l: "Tumble" }]}
               value={ui.perspectiveMode}
               onChange={(v) => set({ perspectiveMode: v })} />
           </Row>
@@ -1161,8 +1504,29 @@ export default function CoinStudio() {
                 onChange={(v) => set({ scatterAmount: v })} />
             </Row>
           )}
+          </Collapsible>
 
-          <SectionLabel>Layout</SectionLabel>
+          <Collapsible title="Easing">
+          <Row label="Curve">
+            <Segment
+              options={[
+                { v: "linear", l: "Linear" },
+                { v: "in", l: "In" },
+                { v: "out", l: "Out" },
+                { v: "inout", l: "InOut" },
+              ]}
+              value={ui.easing}
+              onChange={(v) => set({ easing: v })} />
+          </Row>
+          {ui.easing !== "linear" && (
+            <Row label="Strength (sharp ↔ soft)" value={ui.easingStrength.toFixed(2)}>
+              <Slider min={1} max={5} step={0.1} value={ui.easingStrength}
+                onChange={(v) => set({ easingStrength: v })} />
+            </Row>
+          )}
+          </Collapsible>
+
+          <Collapsible title="Layout">
           <Row label="Overall scale" value={ui.overallScale.toFixed(2)}>
             <Slider min={0.2} max={2} step={0.01} value={ui.overallScale}
               onChange={(v) => set({ overallScale: v })} />
@@ -1179,37 +1543,54 @@ export default function CoinStudio() {
           <Row label="Tilt" value={ui.tilt.toFixed(2)}>
             <Slider min={-0.6} max={0.6} step={0.01} value={ui.tilt} onChange={(v) => set({ tilt: v })} />
           </Row>
+          </Collapsible>
 
-          <SectionLabel>Float</SectionLabel>
+          <Collapsible title="Float">
           <Row label="Amplitude" value={ui.floatAmp.toFixed(2)}>
             <Slider min={0} max={1} step={0.01} value={ui.floatAmp} onChange={(v) => set({ floatAmp: v })} />
           </Row>
           <Row label="Speed" value={ui.floatSpeed.toFixed(2)}>
             <Slider min={0} max={3} step={0.01} value={ui.floatSpeed} onChange={(v) => set({ floatSpeed: v })} />
           </Row>
+          </Collapsible>
 
-          <SectionLabel>Material</SectionLabel>
+          <Collapsible title="Material">
           <Row label="Metalness" value={ui.metalness.toFixed(2)}>
             <Slider min={0} max={1} step={0.01} value={ui.metalness} onChange={(v) => set({ metalness: v })} />
           </Row>
           <Row label="Roughness" value={ui.roughness.toFixed(2)}>
             <Slider min={0} max={1} step={0.01} value={ui.roughness} onChange={(v) => set({ roughness: v })} />
           </Row>
+          </Collapsible>
 
-          <SectionLabel>Glow</SectionLabel>
+          <Collapsible title="Glow">
           <Row label="Intensity" value={ui.glow.toFixed(2)}>
             <Slider min={0} max={1.5} step={0.01} value={ui.glow} onChange={(v) => set({ glow: v })} />
           </Row>
           <Row label="Range" value={ui.glowRange.toFixed(2)}>
             <Slider min={0.6} max={3} step={0.01} value={ui.glowRange} onChange={(v) => set({ glowRange: v })} />
           </Row>
+          </Collapsible>
 
-          <SectionLabel>Lighting</SectionLabel>
+          <Collapsible title="Lighting">
           <Row label="Intensity" value={ui.light.toFixed(2)}>
             <Slider min={0} max={4} step={0.01} value={ui.light} onChange={(v) => set({ light: v })} />
           </Row>
-          <div className="mb-4 rounded-lg border border-slate-700 bg-slate-800/40 p-3">
-            <div className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Right soft light</div>
+          <div className="mb-3 rounded-md border border-slate-700 bg-slate-800/40 p-2.5">
+            <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">
+              Face reflection
+            </div>
+            <Row label="Intensity" value={ui.reflectionOpacity.toFixed(2)}>
+              <Slider min={0} max={1} step={0.01} value={ui.reflectionOpacity}
+                onChange={(v) => set({ reflectionOpacity: v })} />
+            </Row>
+            <Row label="Blur (sharp ↔ soft)" value={ui.reflectionBlur.toFixed(2)}>
+              <Slider min={0} max={1} step={0.01} value={ui.reflectionBlur}
+                onChange={(v) => set({ reflectionBlur: v })} />
+            </Row>
+          </div>
+          <div className="mb-3 rounded-md border border-slate-700 bg-slate-800/40 p-2.5">
+            <div className="mb-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-slate-400">Right soft light</div>
             <Row label="Horizontal" value={ui.rightLightX.toFixed(1)}>
               <Slider min={-10} max={10} step={0.1} value={ui.rightLightX} onChange={(v) => set({ rightLightX: v })} />
             </Row>
@@ -1223,57 +1604,70 @@ export default function CoinStudio() {
               <Slider min={1} max={20} step={0.1} value={ui.rightLightSoftness} onChange={(v) => set({ rightLightSoftness: v })} />
             </Row>
           </div>
-          <SectionLabel>Scene</SectionLabel>
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-[13px] font-medium text-slate-200">Dot grid</span>
+          </Collapsible>
+
+          <Collapsible title="Scene">
+          <div className="flex items-center justify-between mb-2.5">
+            <span className="text-[11.5px] font-medium text-slate-200">Dot grid</span>
             <Switch checked={ui.grid} onChange={(v) => set({ grid: v })} />
           </div>
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-[13px] font-medium text-slate-200">Auto-orbit</span>
+          <div className="flex items-center justify-between mb-2.5">
+            <span className="text-[11.5px] font-medium text-slate-200">Auto-orbit</span>
             <Switch checked={ui.autoOrbit} onChange={(v) => set({ autoOrbit: v })} />
           </div>
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-[13px] font-medium text-slate-200">Orbit ring</span>
+          <div className="flex items-center justify-between mb-2.5">
+            <span className="text-[11.5px] font-medium text-slate-200">Orbit ring</span>
             <Switch checked={ui.showRing} onChange={(v) => set({ showRing: v })} />
           </div>
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-[13px] font-medium text-slate-200">Shadow</span>
+          <div className="flex items-center justify-between mb-2.5">
+            <span className="text-[11.5px] font-medium text-slate-200">Shadow</span>
             <Switch checked={ui.showShadow} onChange={(v) => set({ showShadow: v })} />
           </div>
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-[13px] font-medium text-slate-200">Background</span>
+          <div className="flex items-center justify-between mb-2.5">
+            <span className="text-[11.5px] font-medium text-slate-200">Background</span>
             <input type="color" value={ui.bgColor}
               onChange={(e) => set({ bgColor: e.target.value })}
               className="w-10 h-7 rounded border border-slate-700 bg-transparent cursor-pointer" />
           </div>
+          </Collapsible>
 
           <SectionLabel>Coins</SectionLabel>
           <Row label="Order">
             <Segment
-              options={[{ v: "asc", l: "Ascending" }, { v: "desc", l: "Descending" }]}
+              options={[{ v: "asc", l: "Ascend" }, { v: "desc", l: "Descend" }]}
               value={ui.coinOrder}
               onChange={(v) => set({ coinOrder: v })} />
           </Row>
+          <Row label="Layering">
+            <Segment
+              options={[
+                { v: "auto",  l: "Auto" },
+                { v: "first", l: "First top" },
+                { v: "last",  l: "Last top" },
+              ]}
+              value={ui.coinLayering}
+              onChange={(v) => set({ coinLayering: v })} />
+          </Row>
           <button
             onClick={() => setCoins((cs) => cs.map((c) => ({ ...c, angleOffset: 0 })))}
-            className="w-full py-1.5 mb-3 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-300 text-[12px] font-medium">
+            className="w-full h-7 mb-2.5 rounded-md border border-slate-700 hover:bg-slate-800 text-slate-300 text-[10.5px] font-medium">
             Reset all positions
           </button>
-          <div className="flex items-center gap-2 mb-3">
-            <label className="text-[12px] text-slate-300 flex-none">Count</label>
+          <div className="flex items-center gap-2 mb-2.5">
+            <label className="text-[11px] text-slate-300 flex-none">Count</label>
             <input type="number" min={1} max={64} value={coins.length}
               onChange={(e) => setCoinCount(parseInt(e.target.value, 10))}
-              className="w-16 px-2 py-1 rounded bg-slate-900 border border-slate-700 text-slate-100 text-[12px] tabular-nums" />
+              className="w-14 h-6 px-2 rounded bg-slate-900 border border-slate-700 text-slate-100 text-[10.5px] tabular-nums" />
             <button onClick={addCoin}
-              className="flex-1 py-1.5 rounded-lg bg-indigo-500 hover:bg-indigo-400 text-white text-[12px] font-medium">
+              className="flex-1 h-6 inline-flex items-center justify-center rounded-md bg-slate-100 hover:bg-white text-slate-900 text-[10.5px] font-medium">
               + Add
             </button>
           </div>
           <div className="space-y-3">
             {coins.map((c, i) => (
-              <div key={c.key} className="p-3 rounded-lg bg-slate-800/50 border border-slate-700">
+              <div key={c.key} className="p-2.5 rounded-md bg-slate-800/50 border border-slate-700">
                 <div className="flex items-center justify-between mb-2">
-                  <span className="text-[12px] font-medium text-slate-200">#{i + 1} · {c.palette}</span>
+                  <span className="text-[11px] font-medium text-slate-200">#{i + 1} · {c.palette}</span>
                   <div className="flex gap-1">
                     <button onClick={() => dupCoin(c.key)} title="Duplicate"
                       className="px-2 py-0.5 rounded text-[11px] bg-slate-700 hover:bg-slate-600">⧉</button>
@@ -1285,7 +1679,7 @@ export default function CoinStudio() {
                   {["front", "back"].map((side) => (
                     <label key={side} className="flex flex-col gap-1 cursor-pointer">
                       <span className="text-[10px] uppercase tracking-wider text-slate-400">{side}</span>
-                      <div className="h-14 rounded border border-dashed border-slate-600 hover:border-indigo-400 flex items-center justify-center overflow-hidden bg-slate-900/60">
+                      <div className="h-14 rounded border border-dashed border-slate-600 hover:border-slate-400 flex items-center justify-center overflow-hidden bg-slate-900/60">
                         {c[side]
                           ? <img src={c[side]} alt="" className="w-full h-full object-cover" />
                           : <span className="text-[10px] text-slate-500">Upload</span>}
@@ -1295,20 +1689,6 @@ export default function CoinStudio() {
                     </label>
                   ))}
                 </div>
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-[10px] uppercase tracking-wider text-slate-400">Position</span>
-                  <div className="flex items-center gap-2">
-                    <span className="text-[11px] tabular-nums text-slate-400 font-mono">
-                      {Math.round(((c.angleOffset || 0) * 180) / Math.PI)}°
-                    </span>
-                    <button
-                      onClick={() => setCoins((cs) => cs.map((x) => x.key === c.key ? { ...x, angleOffset: 0 } : x))}
-                      className="text-[10px] text-slate-400 hover:text-indigo-300">reset</button>
-                  </div>
-                </div>
-                <Slider min={-180} max={180} step={1}
-                  value={Math.round(((c.angleOffset || 0) * 180) / Math.PI)}
-                  onChange={(deg) => setCoins((cs) => cs.map((x) => x.key === c.key ? { ...x, angleOffset: (deg * Math.PI) / 180 } : x))} />
               </div>
             ))}
           </div>
@@ -1317,7 +1697,7 @@ export default function CoinStudio() {
           <Row label="Resolution frame">
             <select value={ui.exportPreset}
               onChange={(e) => set({ exportPreset: e.target.value })}
-              className="w-full px-2 py-1.5 rounded bg-slate-900 border border-slate-700 text-slate-100 text-[12px]">
+              className="w-full h-7 px-2 rounded-md bg-slate-900 border border-slate-700 text-slate-100 text-[10.5px]">
               {Object.entries(EXPORT_PRESETS).map(([k, v]) => (
                 <option key={k} value={k}>{v.label}</option>
               ))}
@@ -1339,11 +1719,11 @@ export default function CoinStudio() {
               </label>
             </div>
           )}
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-[13px] font-medium text-slate-200">Show frame overlay</span>
+          <div className="flex items-center justify-between mb-2.5">
+            <span className="text-[11.5px] font-medium text-slate-200">Show frame overlay</span>
             <Switch checked={ui.showExportFrame} onChange={(v) => set({ showExportFrame: v })} />
           </div>
-          <Row label="Duration (s)" value={ui.exportDuration.toFixed(1)}>
+          <Row label="Duration" value={ui.exportDuration.toFixed(1)} unit="s">
             <Slider min={1} max={30} step={0.5} value={ui.exportDuration}
               onChange={(v) => set({ exportDuration: v })} />
           </Row>
@@ -1353,7 +1733,7 @@ export default function CoinStudio() {
               value={ui.exportFps}
               onChange={(v) => set({ exportFps: v })} />
           </Row>
-          <Row label="Video bitrate (Mbps)" value={ui.exportBitrate.toFixed(0)}>
+          <Row label="Video bitrate" value={ui.exportBitrate.toFixed(0)} unit="Mbps">
             <Slider min={2} max={80} step={1} value={ui.exportBitrate}
               onChange={(v) => set({ exportBitrate: v })} />
           </Row>
@@ -1361,25 +1741,25 @@ export default function CoinStudio() {
             <Slider min={1} max={30} step={1} value={ui.exportGifQuality}
               onChange={(v) => set({ exportGifQuality: v })} />
           </Row>
-          <div className="flex items-center justify-between mb-3">
-            <span className="text-[13px] font-medium text-slate-200">Transparent bg</span>
+          <div className="flex items-center justify-between mb-2.5">
+            <span className="text-[11.5px] font-medium text-slate-200">Transparent bg</span>
             <Switch checked={ui.transparentBg} onChange={(v) => set({ transparentBg: v })} />
           </div>
-          <div className="grid grid-cols-2 gap-2">
+          <div className="grid grid-cols-2 gap-1.5">
             <button onClick={exportJSON}
-              className="py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-200 text-[12px] font-medium">JSON</button>
+              className="h-7 rounded-md border border-slate-700 hover:bg-slate-800 text-slate-200 text-[10.5px] font-medium">JSON</button>
             <button onClick={exportPNG}
-              className="py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-200 text-[12px] font-medium">PNG</button>
+              className="h-7 rounded-md border border-slate-700 hover:bg-slate-800 text-slate-200 text-[10.5px] font-medium">PNG</button>
             <button onClick={exportWebM} disabled={!!recording}
-              className="py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-200 text-[12px] font-medium disabled:opacity-60">
+              className="h-7 rounded-md border border-slate-700 hover:bg-slate-800 text-slate-200 text-[10.5px] font-medium disabled:opacity-60">
               {recording === "webm" ? "Recording…" : "WebM"}
             </button>
             <button onClick={exportMP4} disabled={!!recording}
-              className="py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-200 text-[12px] font-medium disabled:opacity-60">
+              className="h-7 rounded-md border border-slate-700 hover:bg-slate-800 text-slate-200 text-[10.5px] font-medium disabled:opacity-60">
               {recording === "mp4" ? "Recording…" : "MP4"}
             </button>
             <button onClick={exportGIF} disabled={gifting}
-              className="col-span-2 py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-200 text-[12px] font-medium disabled:opacity-60">
+              className="col-span-2 h-7 rounded-md border border-slate-700 hover:bg-slate-800 text-slate-200 text-[10.5px] font-medium disabled:opacity-60">
               {gifting ? "Encoding…" : "GIF"}
             </button>
           </div>
@@ -1390,7 +1770,7 @@ export default function CoinStudio() {
           </p>
         </div>
 
-        <div className="px-5 py-3 border-t border-slate-800 text-[11px] text-slate-500">
+        <div className="px-4 py-2.5 border-t border-slate-800 text-[10px] text-slate-500">
           Drag the stage to orbit
         </div>
       </aside>
@@ -1405,11 +1785,27 @@ export default function CoinStudio() {
           style={{ background: "linear-gradient(#ffffffcc, transparent)" }} />
         <div className="absolute inset-0 flex items-center justify-center text-center pointer-events-none z-0">
           <div>
-            <div className="text-[22px] font-semibold text-slate-800/70 tracking-tight">A New Era of Digital Ownership</div>
-            <div className="text-[12px] text-slate-500/80 mt-1">Empowered by blockchain — yours to shape</div>
+            <div className="text-[20px] font-semibold text-slate-800/70 tracking-tight">A New Era of Digital Ownership</div>
+            <div className="text-[11px] text-slate-500/80 mt-1">Empowered by blockchain — yours to shape</div>
           </div>
         </div>
-        <div ref={mountRef} className="absolute inset-0 z-10" />
+        <div ref={mountRef} className="absolute inset-0 z-10"
+          style={{ filter: canvasFilter || undefined }} />
+        {ui.fxVignette > 0 && (
+          <div className="absolute inset-0 pointer-events-none z-20"
+            style={{
+              background: `radial-gradient(ellipse at center, transparent ${(1 - ui.fxVignette) * 55 + 20}%, rgba(0,0,0,${(ui.fxVignette * 0.9).toFixed(2)}) 100%)`,
+            }} />
+        )}
+        {ui.fxGrain > 0 && (
+          <div className="absolute inset-0 pointer-events-none z-20 mix-blend-overlay"
+            style={{
+              opacity: ui.fxGrain,
+              backgroundImage:
+                "url(\"data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 0 0.5 0 0 0 1 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>\")",
+              backgroundSize: "180px 180px",
+            }} />
+        )}
         {/* On-canvas light source: drag it around the open space to choose
             where the broad right softbox shines from. */}
         <div className="absolute z-30 pointer-events-none"
@@ -1418,7 +1814,7 @@ export default function CoinStudio() {
             top: `${95 - ((ui.rightLightY + 10) / 20) * 90}%`,
             transform: "translate(-50%, -50%)",
           }}>
-          <span className="pointer-events-none absolute left-1/2 top-10 -translate-x-1/2 -translate-y-1/2 rounded-full border border-indigo-400/35 bg-indigo-300/5 transition-[width,height,opacity] duration-150"
+          <span className="pointer-events-none absolute left-1/2 top-10 -translate-x-1/2 -translate-y-1/2 rounded-full border border-slate-400/35 bg-slate-200/5 transition-[width,height,opacity] duration-150"
             style={{
               width: `${Math.max(100, ui.rightLightSoftness * 24)}px`,
               height: `${Math.max(100, ui.rightLightSoftness * 24)}px`,
@@ -1439,10 +1835,10 @@ export default function CoinStudio() {
               (draggingLight ? "cursor-grabbing" : "cursor-grab")}>
             <span className={"relative grid h-20 w-20 place-items-center rounded-full border-2 transition-all " +
               (draggingLight
-                ? "border-indigo-400 bg-indigo-100/90 shadow-[0_0_0_10px_rgba(99,102,241,0.14),0_0_38px_rgba(99,102,241,0.45)]"
-                : "border-indigo-400/80 bg-white/75 shadow-[0_0_0_7px_rgba(99,102,241,0.10),0_8px_24px_rgba(67,56,202,0.25)] group-hover:border-indigo-500 group-hover:bg-white/95") }>
-              <span className="absolute inset-2 rounded-full border border-indigo-300/80" />
-              <span className="grid h-9 w-9 place-items-center rounded-full bg-indigo-500 text-lg text-white shadow-lg">✦</span>
+                ? "border-slate-300 bg-slate-100/90 shadow-[0_0_0_10px_rgba(148,163,184,0.18),0_0_38px_rgba(148,163,184,0.45)]"
+                : "border-slate-400/80 bg-white/75 shadow-[0_0_0_7px_rgba(148,163,184,0.12),0_8px_24px_rgba(30,41,59,0.35)] group-hover:border-slate-200 group-hover:bg-white/95") }>
+              <span className="absolute inset-2 rounded-full border border-slate-300/80" />
+              <span className="grid h-9 w-9 place-items-center rounded-full bg-slate-800 text-lg text-white shadow-lg">✦</span>
             </span>
             <span className="rounded-full bg-slate-900/75 px-2.5 py-1 text-[11px] font-medium text-white shadow-sm backdrop-blur">
               Drag light
