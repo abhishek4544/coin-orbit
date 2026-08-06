@@ -1,5 +1,6 @@
 import { useRef, useEffect, useState, useCallback } from "react";
 import * as THREE from "three";
+import { ArrayBufferTarget, Muxer } from "mp4-muxer";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { RectAreaLightUniformsLib } from "three/examples/jsm/lights/RectAreaLightUniformsLib.js";
 
@@ -1264,7 +1265,91 @@ export default function CoinStudio() {
     setTimeout(() => rec.stop(), Math.max(500, s.exportDuration * 1000));
   };
   const exportWebM = () => recordVideo("webm");
-  const exportMP4 = () => recordVideo("mp4");
+  const exportMP4 = async () => {
+    if (!api.current || recording) return;
+
+    // MediaRecorder advertises MP4 support in some Chromium builds, but then
+    // emits no data from a canvas stream. WebCodecs gives us the actual H.264
+    // encoder and mp4-muxer packages the frames into a standards-compliant MP4.
+    if (!("VideoEncoder" in window) || !("VideoFrame" in window)) {
+      recordVideo("mp4");
+      return;
+    }
+
+    const s = settings.current;
+    api.current.resetOrbit();
+    const { w, h } = exportDims();
+    api.current.beginExport(w, h);
+    setRecording("mp4");
+
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      const canvasEl = api.current.getCanvas();
+      const bitrate = Math.round(s.exportBitrate * 1_000_000);
+      const encoderOptions = ["avc1.640034", "avc1.4D0034", "avc1.42E034", "avc1.420034"];
+      let config = null;
+
+      for (const codec of encoderOptions) {
+        const candidate = { codec, width: w, height: h, bitrate, framerate: s.exportFps };
+        try {
+          const support = await VideoEncoder.isConfigSupported(candidate);
+          if (support.supported) {
+            config = candidate;
+            break;
+          }
+        } catch {
+          // Try the next H.264 profile supported by this browser/device.
+        }
+      }
+
+      if (!config) throw new Error("No supported H.264 encoder configuration");
+
+      const target = new ArrayBufferTarget();
+      const muxer = new Muxer({
+        target,
+        video: { codec: "avc", width: w, height: h, frameRate: s.exportFps },
+        fastStart: "in-memory",
+      });
+      let encoderError = null;
+      const encoder = new VideoEncoder({
+        output: (chunk, metadata) => muxer.addVideoChunk(chunk, metadata),
+        error: (error) => { encoderError = error; },
+      });
+      encoder.configure(config);
+
+      const totalFrames = Math.max(1, Math.round(s.exportDuration * s.exportFps));
+      const frameDuration = Math.round(1_000_000 / s.exportFps);
+      const startedAt = performance.now();
+
+      for (let i = 0; i < totalFrames; i += 1) {
+        if (encoderError) throw encoderError;
+        const frame = new VideoFrame(canvasEl, {
+          timestamp: i * frameDuration,
+          duration: frameDuration,
+        });
+        encoder.encode(frame, { keyFrame: i === 0 || i % (s.exportFps * 2) === 0 });
+        frame.close();
+        // Avoid queueing dozens of 4K frames if the hardware encoder is slower
+        // than the requested frame rate.
+        if (encoder.encodeQueueSize > 2) await encoder.flush();
+
+        const nextFrameAt = startedAt + ((i + 1) * 1_000) / s.exportFps;
+        await new Promise((resolve) => setTimeout(resolve, Math.max(0, nextFrameAt - performance.now())));
+      }
+
+      await encoder.flush();
+      if (encoderError) throw encoderError;
+      encoder.close();
+      muxer.finalize();
+      download("coin-studio.mp4", new Blob([target.buffer], { type: "video/mp4" }));
+    } catch (error) {
+      console.error("MP4 export failed", error);
+      alert("Could not create an H.264 MP4 on this device. Try a smaller export size, then export again.");
+    } finally {
+      api.current.endExport();
+      setRecording(null);
+    }
+  };
   const [gifting, setGifting] = useState(false);
   const exportGIF = async () => {
     if (!api.current || gifting) return;
