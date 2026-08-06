@@ -516,11 +516,24 @@ const DropdownSelect = ({ value, onChange, groups, placeholder = "Select" }) => 
 //  UTILITIES
 // =========================================================================
 function download(name, blob) {
+  if (!(blob instanceof Blob) || blob.size === 0) {
+    alert(`Could not create ${name}. Please try the export again.`);
+    return false;
+  }
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = url; a.download = name;
-  document.body.appendChild(a); a.click();
-  setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 500);
+  a.href = url;
+  a.download = name;
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  // Safari can still be reading the object URL after the click handler has
+  // returned. Revoking it immediately can leave a downloaded file at 0 bytes.
+  setTimeout(() => {
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, 60_000);
+  return true;
 }
 function loadScript(src) {
   return new Promise((resolve, reject) => {
@@ -1215,19 +1228,39 @@ export default function CoinStudio() {
     await new Promise((r) => setTimeout(r, 350));
     const canvasEl = api.current.getCanvas();
     const stream = canvasEl.captureStream(s.exportFps);
-    const rec = new MediaRecorder(stream, {
-      mimeType: mime,
-      videoBitsPerSecond: Math.round(s.exportBitrate * 1_000_000),
-    });
+    let rec;
+    try {
+      rec = new MediaRecorder(stream, {
+        mimeType: mime,
+        videoBitsPerSecond: Math.round(s.exportBitrate * 1_000_000),
+      });
+    } catch (error) {
+      api.current.endExport();
+      alert(`Could not start ${fmt.toUpperCase()} recording in this browser.`);
+      return;
+    }
     const chunks = [];
     rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
     rec.onstop = () => {
       api.current.endExport();
-      download(`coin-studio.${fmt}`, new Blob(chunks, { type: mime }));
+      stream.getTracks().forEach((track) => track.stop());
+      const video = new Blob(chunks, { type: mime });
+      if (video.size === 0) {
+        alert(fmt === "mp4"
+          ? "Your browser could not encode this MP4. Export WebM, then convert it to MP4, or try Safari."
+          : "Your browser could not encode this WebM. Please try again.");
+      } else {
+        download(`coin-studio.${fmt}`, video);
+      }
       setRecording(null);
     };
+    rec.onerror = () => {
+      if (rec.state !== "inactive") rec.stop();
+    };
     setRecording(fmt);
-    rec.start();
+    // Request periodic chunks so browsers do not depend on one final chunk at
+    // stop time (a common source of empty MP4 downloads).
+    rec.start(1_000);
     setTimeout(() => rec.stop(), Math.max(500, s.exportDuration * 1000));
   };
   const exportWebM = () => recordVideo("webm");
