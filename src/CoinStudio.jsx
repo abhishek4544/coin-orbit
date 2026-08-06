@@ -1,6 +1,7 @@
 import { useRef, useEffect, useState, useCallback } from "react";
 import * as THREE from "three";
 import { ArrayBufferTarget, Muxer } from "mp4-muxer";
+import h264EncoderScript from "h264-mp4-encoder/embuild/dist/h264-mp4-encoder.web.js?url";
 import { RoomEnvironment } from "three/examples/jsm/environments/RoomEnvironment.js";
 import { RectAreaLightUniformsLib } from "three/examples/jsm/lights/RectAreaLightUniformsLib.js";
 
@@ -543,6 +544,46 @@ function loadScript(src) {
     s.src = src; s.onload = resolve; s.onerror = reject;
     document.head.appendChild(s);
   });
+}
+async function encodeSoftwareMp4(canvasEl, width, height, settings) {
+  // This fallback is loaded only on devices whose H.264 hardware encoder
+  // rejects the selected size (notably 4K square canvases).
+  await loadScript(h264EncoderScript);
+  if (!window.HME?.createH264MP4Encoder) {
+    throw new Error("The software MP4 encoder did not load");
+  }
+
+  const encoder = await window.HME.createH264MP4Encoder();
+  const frameCanvas = document.createElement("canvas");
+  frameCanvas.width = width;
+  frameCanvas.height = height;
+  const frameContext = frameCanvas.getContext("2d", { willReadFrequently: true });
+  if (!frameContext) throw new Error("Could not prepare MP4 frames");
+
+  try {
+    encoder.width = width;
+    encoder.height = height;
+    encoder.frameRate = settings.exportFps;
+    encoder.kbps = Math.max(1_000, Math.round(settings.exportBitrate * 1_000));
+    encoder.speed = 8;
+    encoder.groupOfPictures = Math.max(1, Math.round(settings.exportFps * 2));
+    encoder.initialize();
+
+    const totalFrames = Math.max(1, Math.round(settings.exportDuration * settings.exportFps));
+    const startedAt = performance.now();
+    for (let i = 0; i < totalFrames; i += 1) {
+      frameContext.drawImage(canvasEl, 0, 0, width, height);
+      encoder.addFrameRgba(frameContext.getImageData(0, 0, width, height).data);
+
+      const nextFrameAt = startedAt + ((i + 1) * 1_000) / settings.exportFps;
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, nextFrameAt - performance.now())));
+    }
+
+    encoder.finalize();
+    return new Blob([encoder.FS.readFile(encoder.outputFilename)], { type: "video/mp4" });
+  } finally {
+    encoder.delete();
+  }
 }
 
 // =========================================================================
@@ -1278,7 +1319,11 @@ export default function CoinStudio() {
 
     const s = settings.current;
     api.current.resetOrbit();
-    const { w, h } = exportDims();
+    const requestedDims = exportDims();
+    // H.264 requires even frame dimensions. Keep custom odd-sized exports as
+    // close as possible while producing a valid MP4.
+    const w = Math.max(2, requestedDims.w - (requestedDims.w % 2));
+    const h = Math.max(2, requestedDims.h - (requestedDims.h % 2));
     api.current.beginExport(w, h);
     setRecording("mp4");
 
@@ -1341,10 +1386,19 @@ export default function CoinStudio() {
       if (encoderError) throw encoderError;
       encoder.close();
       muxer.finalize();
-      download("coin-studio.mp4", new Blob([target.buffer], { type: "video/mp4" }));
+      if (!download("coin-studio.mp4", new Blob([target.buffer], { type: "video/mp4" }))) {
+        throw new Error("Hardware encoder created an empty MP4");
+      }
     } catch (error) {
-      console.error("MP4 export failed", error);
-      alert("Could not create an H.264 MP4 on this device. Try a smaller export size, then export again.");
+      console.warn("Hardware MP4 export failed; using the software encoder.", error);
+      try {
+        if (!download("coin-studio.mp4", await encodeSoftwareMp4(api.current.getCanvas(), w, h, s))) {
+          throw new Error("Software encoder created an empty MP4");
+        }
+      } catch (fallbackError) {
+        console.error("Software MP4 export failed", fallbackError);
+        alert("Could not create the MP4. Please try a smaller export size and export again.");
+      }
     } finally {
       api.current.endExport();
       setRecording(null);
