@@ -6,7 +6,10 @@ import { RectAreaLightUniformsLib } from "three/examples/jsm/lights/RectAreaLigh
 // =========================================================================
 //  TEXTURE HELPERS
 // =========================================================================
-const S = 512;
+// Face/halo/shadow canvas resolution. Bumped from 512 → 2048 so uploaded coin
+// artwork stays crisp at 4K exports (a coin rendered ~1200px on the export
+// canvas now has enough source pixels to match without visible upscaling).
+const S = 2048;
 const canvas = () => {
   const c = document.createElement("canvas");
   c.width = c.height = S;
@@ -62,7 +65,7 @@ function makeTex(painter) {
   const c = canvas();
   painter(c.getContext("2d"));
   const t = new THREE.CanvasTexture(c);
-  t.anisotropy = 8;
+  t.anisotropy = 16;
   t.colorSpace = THREE.SRGBColorSpace;
   return t;
 }
@@ -97,7 +100,7 @@ function imageFaceTex(dataUrl) {
       ctx.fillRect(0, 0, S, S);
       ctx.restore();
       const t = new THREE.CanvasTexture(c);
-      t.anisotropy = 8;
+      t.anisotropy = 16;
       t.colorSpace = THREE.SRGBColorSpace;
       resolve(t);
     };
@@ -125,7 +128,7 @@ function edgeTex(a, b) {
   const t = new THREE.CanvasTexture(c);
   t.wrapS = THREE.RepeatWrapping;
   t.repeat.set(64, 1);
-  t.anisotropy = 8;
+  t.anisotropy = 16;
   t.colorSpace = THREE.SRGBColorSpace;
   return t;
 }
@@ -276,7 +279,7 @@ const DEFAULT_FRONT = "/images/coins/front.png";
 const DEFAULT_BACK  = "/images/coins/back.png";
 // Start with a complete, balanced orbit. Seven coins gives the hero enough
 // presence without making the individual faces feel crowded or cropped.
-const DEFAULT_COIN_COUNT = 7;
+const DEFAULT_COIN_COUNT = 9;
 
 const newId = () =>
   (typeof crypto !== "undefined" && crypto.randomUUID && crypto.randomUUID()) ||
@@ -348,29 +351,33 @@ function loadScript(src) {
 
 // =========================================================================
 const DEFAULTS = {
-  playing: true, rotSpeed: 0, dir: 1, orbitSpeed: 0.25,
-  floatAmp: 0.16, floatSpeed: 0.55, tilt: 0,
-  orbitR: 2.2, size: 0.6, thick: 0.13, overallScale: 0.7,
-  metalness: 0.35, roughness: 0.55,
-  // Zero is the natural studio base; the draggable light is an optional overlay.
-  light: 0, grid: true, autoOrbit: false,
-  // Keep the softbox outside the coin orbit for a natural studio-style key light.
-  rightLightX: 8, rightLightY: 7, rightLightZ: 10,
+  playing: true, rotSpeed: 0.36, dir: 1, orbitSpeed: 0.4,
+  floatAmp: 0.08, floatSpeed: 0.55, tilt: 0,
+  orbitR: 2.3, size: 0.54, thick: 0.14, overallScale: 1.27,
+  metalness: 0.48, roughness: 0.55,
+  light: 1.4, grid: false, autoOrbit: false,
+  rightLightX: 7.9, rightLightY: 7.1, rightLightZ: 10,
   rightLightSoftness: 12,
   bgColor: "#ffffff",
   showRing: false, showShadow: false,
-  glow: 0.4, glowRange: 1.6,
+  glow: 0.4, glowRange: 1.71,
   naturalTilt: false, naturalTiltAmount: 0.35, naturalTiltWobble: 0.4,
+  perspectiveMode: "perspective", perspectiveIntensity: 0.3,
+  scatterEnabled: false, scatterAmount: 0.5,
+  coinOrder: "asc",
   transparentBg: false,
-  exportDuration: 5, exportFps: 30, exportBitrate: 8, exportGifQuality: 10,
-  exportPreset: "viewport",
-  exportWidth: 1080, exportHeight: 1080,
+  exportDuration: 5, exportFps: 30, exportBitrate: 60, exportGifQuality: 10,
+  exportPreset: "square4k",
+  exportWidth: 4096, exportHeight: 4096,
   showExportFrame: true,
 };
 
 const EXPORT_PRESETS = {
   viewport:  { label: "Viewport" },
-  square:    { label: "1:1 · 1080",     w: 1080, h: 1080 },
+  square1080:{ label: "Square · 1080 × 1080", w: 1080, h: 1080 },
+  square1440:{ label: "Square · 1440 × 1440", w: 1440, h: 1440 },
+  square2k:  { label: "Square · 2K (2048 × 2048)", w: 2048, h: 2048 },
+  square4k:  { label: "Square · 4K (4096 × 4096)", w: 4096, h: 4096 },
   landscape: { label: "16:9 · 1920×1080", w: 1920, h: 1080 },
   portrait:  { label: "9:16 · 1080×1920", w: 1080, h: 1920 },
   wide:      { label: "21:9 · 2560×1080", w: 2560, h: 1080 },
@@ -386,6 +393,22 @@ export default function CoinStudio() {
   const settings = useRef({ ...DEFAULTS });
   const [ui, setUi] = useState({ ...DEFAULTS });
   const [draggingLight, setDraggingLight] = useState(false);
+  const [stageSize, setStageSize] = useState({ w: 800, h: 600 });
+
+  // Track the stage's live size so the export frame can render at its true
+  // proportional size (small dims → small frame) instead of always filling 94%.
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const measure = () => {
+      const r = el.getBoundingClientRect();
+      setStageSize({ w: r.width, h: r.height });
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const set = useCallback((patch) => {
     setUi((p) => { const n = { ...p, ...patch }; settings.current = n; return n; });
@@ -435,6 +458,64 @@ export default function CoinStudio() {
     };
   }, [moveStageLight]);
 
+  // Frame-resize state — dragging an edge/corner of the export overlay writes
+  // exportWidth/exportHeight directly (auto-switching preset to "custom").
+  const frameDragRef = useRef(null);
+  useEffect(() => {
+    const move = (e) => {
+      const d = frameDragRef.current;
+      if (!d) return;
+      const dx = e.clientX - d.startX;
+      const dy = e.clientY - d.startY;
+      // Convert cursor CSS pixels back to export pixels via the frame's live
+      // display scale at drag start. Frame is centered, so 1px cursor movement
+      // = 2px change in export dimension.
+      let w = d.startW, h = d.startH;
+      if (d.edge.includes("e")) w = d.startW + 2 * dx / d.displayScale;
+      if (d.edge.includes("w")) w = d.startW - 2 * dx / d.displayScale;
+      if (d.edge.includes("s")) h = d.startH + 2 * dy / d.displayScale;
+      if (d.edge.includes("n")) h = d.startH - 2 * dy / d.displayScale;
+      w = Math.max(128, Math.min(4096, Math.round(w)));
+      h = Math.max(128, Math.min(4096, Math.round(h)));
+      set({ exportWidth: w, exportHeight: h });
+    };
+    const end = () => { frameDragRef.current = null; };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", end);
+    window.addEventListener("pointercancel", end);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", end);
+      window.removeEventListener("pointercancel", end);
+    };
+  }, [set]);
+
+  const beginFrameResize = useCallback((edge) => (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const s = settings.current;
+    const preset = EXPORT_PRESETS[s.exportPreset];
+    const startW = (preset && preset.w) || s.exportWidth;
+    const startH = (preset && preset.h) || s.exportHeight;
+    // Same fit math the overlay uses — keeps cursor movement matched to the
+    // frame's visible edge throughout the drag.
+    const displayScale = Math.min(
+      (stageSize.w * 0.94) / startW,
+      (stageSize.h * 0.94) / startH
+    );
+    set({ exportPreset: "custom", exportWidth: startW, exportHeight: startH });
+    frameDragRef.current = {
+      edge,
+      startX: event.clientX,
+      startY: event.clientY,
+      startW, startH,
+      displayScale: Math.max(0.001, displayScale),
+    };
+    if (event.currentTarget.setPointerCapture) {
+      try { event.currentTarget.setPointerCapture(event.pointerId); } catch {}
+    }
+  }, [set, stageSize]);
+
   // Coin list — this is the source of truth.  Each entry is a "spec".
   const [coins, setCoins] = useState(() =>
     Array.from({ length: DEFAULT_COIN_COUNT }, (_, i) => ({
@@ -443,6 +524,7 @@ export default function CoinStudio() {
       front: DEFAULT_FRONT,
       back: DEFAULT_BACK,
       phase: i * 1.2,
+      angleOffset: 0,
     }))
   );
 
@@ -454,6 +536,7 @@ export default function CoinStudio() {
         palette: PALETTE_KEYS[cs.length % PALETTE_KEYS.length],
         front: DEFAULT_FRONT, back: DEFAULT_BACK,
         phase: cs.length * 1.2,
+        angleOffset: 0,
       },
     ]);
   }, []);
@@ -534,6 +617,11 @@ export default function CoinStudio() {
     rightSoftbox.position.set(8, 7, 10);
     rightSoftbox.lookAt(0, 0, 0);
     scene.add(rightSoftbox);
+    // Gentle hemisphere fill blends the shard-like specular the RectAreaLight
+    // otherwise leaves on the metallic edges — sky wash from above, warm floor
+    // bounce from below.
+    const fill = new THREE.HemisphereLight(0xf5f2ff, 0xfff3e0, 0.55);
+    scene.add(fill);
 
     const world = new THREE.Group();
     scene.add(world);
@@ -574,6 +662,15 @@ export default function CoinStudio() {
       shadow.position.set(0, -1.35, -0.6);
       floatG.add(shadow);
       world.add(floatG);
+      // Per-coin random data drives Perspective mode (each coin tumbles on its
+      // own axis at its own speed) and the scatter offsets for the ring.
+      const axis = new THREE.Vector3(
+        Math.random() * 2 - 1,
+        Math.random() * 2 - 1,
+        Math.random() * 2 - 1
+      );
+      if (axis.lengthSq() < 1e-4) axis.set(0, 1, 0);
+      axis.normalize();
       return {
         floatG, tilt, spin,
         coin: built.coin, body: built.body,
@@ -583,6 +680,12 @@ export default function CoinStudio() {
         phase: spec.phase, angle: 0,
         applied: { front: null, back: null },
         rimColors: { a: pal.edge[0], b: pal.edge[1] },
+        flipAxis: axis,
+        flipSpeed: 0.5 + Math.random() * 1.8,
+        flipPhase: Math.random() * Math.PI * 2,
+        scatterAngle: (Math.random() * 2 - 1),
+        scatterRadius: (Math.random() * 2 - 1) * 0.5,
+        angleOffset: spec.angleOffset || 0,
       };
     };
 
@@ -641,6 +744,7 @@ export default function CoinStudio() {
         if (!registry.has(s.key)) registry.set(s.key, buildEntry(s));
         const e = registry.get(s.key);
         e.phase = s.phase;
+        e.angleOffset = s.angleOffset || 0;
         applyFace(e, "front", s.front);
         applyFace(e, "back", s.back);
       });
@@ -655,7 +759,6 @@ export default function CoinStudio() {
       if (!drag) return;
       tY += (e.clientX - px) * 0.006;
       tX += (e.clientY - py) * 0.004;
-      // Clamp both axes so the ring never rotates far enough to leave the frame.
       tX = Math.max(-0.45, Math.min(0.45, tX));
       tY = Math.max(-0.9, Math.min(0.9, tY));
       px = e.clientX; py = e.clientY;
@@ -675,11 +778,15 @@ export default function CoinStudio() {
       if (!w || !h) return;
       const aspect = w / h;
       const s = settings.current;
-      const R = (s.orbitR + s.size) * s.overallScale + 0.8;
+      // Fit for the ring at scale=1 so the user's `overallScale` genuinely
+      // zooms in/out (previously the camera pulled back proportional to
+      // overallScale, cancelling the zoom above ~0.7).
+      const outer = s.orbitR + s.size;
+      const R = outer * 1.5;
       const fovR = camera.fov * Math.PI / 180;
       const distV = R / Math.tan(fovR / 2);
       const distH = R / (Math.tan(fovR / 2) * aspect);
-      camera.position.z = Math.max(distV, distH, 6);
+      camera.position.z = Math.max(distV, distH, 4);
       camera.aspect = aspect;
       camera.updateProjectionMatrix();
     };
@@ -713,24 +820,39 @@ export default function CoinStudio() {
       // The face base remains stable even when the coin is tilted.
       rightSoftbox.intensity = dragLightOn ? 2.5 * s.light : 0;
       rightSoftbox.position.set(s.rightLightX, s.rightLightY, s.rightLightZ);
-      rightSoftbox.width = s.rightLightSoftness;
-      rightSoftbox.height = s.rightLightSoftness;
+      // Enlarge the emitter beyond the softness UI value so the specular on
+      // metallic edges blurs into a soft wash instead of a sharp shard.
+      rightSoftbox.width = s.rightLightSoftness * 2.2;
+      rightSoftbox.height = s.rightLightSoftness * 2.2;
       rightSoftbox.lookAt(0, 0, 0);
 
       const N = currentList.length;
+      const perspective = s.perspectiveMode === "perspective";
       currentList.forEach((spec, i) => {
         const entry = registry.get(spec.key);
         if (!entry) return;
         if (s.playing) {
           entry.angle += dt * s.rotSpeed * s.dir;
-          // Rotate around the face-normal (Z after coin.rotation.x = π/2) so
-          // the design spins in-plane and the face stays toward the camera,
-          // instead of flipping to edge-on at high spin speeds.
-          entry.spin.rotation.z = entry.angle;
         }
-        const orbitA = (i / N) * Math.PI * 2 + ft * s.orbitSpeed * s.dir - Math.PI / 2;
-        entry.floatG.position.x = Math.cos(orbitA) * s.orbitR;
-        entry.floatG.position.y = Math.sin(orbitA) * s.orbitR
+        if (perspective) {
+          // Each coin tumbles on its own random axis; intensity scales the
+          // continuous flip speed so 0 freezes the pose and 1 tumbles fast.
+          const flipAngle =
+            entry.flipPhase + ft * entry.flipSpeed * s.dir * s.perspectiveIntensity * 2
+            + entry.angle;
+          entry.spin.quaternion.setFromAxisAngle(entry.flipAxis, flipAngle);
+        } else {
+          // Rotate around the face-normal (Z after coin.rotation.x = π/2) so
+          // the design spins in-plane and the face stays toward the camera.
+          entry.spin.rotation.set(0, 0, entry.angle);
+        }
+        const scatterA = s.scatterEnabled ? entry.scatterAngle * s.scatterAmount * 1.6 : 0;
+        const scatterR = s.scatterEnabled ? entry.scatterRadius * s.scatterAmount * s.orbitR : 0;
+        const orderIdx = s.coinOrder === "desc" ? (N - 1 - i) : i;
+        const orbitA = (orderIdx / N) * Math.PI * 2 + ft * s.orbitSpeed * s.dir - Math.PI / 2 + scatterA + (entry.angleOffset || 0);
+        const radius = s.orbitR + scatterR;
+        entry.floatG.position.x = Math.cos(orbitA) * radius;
+        entry.floatG.position.y = Math.sin(orbitA) * radius
           + Math.sin(ft * s.floatSpeed + entry.phase) * s.floatAmp;
         entry.tilt.rotation.x = 0.14 + s.tilt;
         entry.floatG.scale.setScalar(s.size);
@@ -754,10 +876,12 @@ export default function CoinStudio() {
           entry.floatG.position.x - s.rightLightX,
           entry.floatG.position.y - s.rightLightY
         );
-        const spread = Math.max(1, s.rightLightSoftness * 0.9);
-        const lightFalloff = Math.max(0, 1 - lightDistance / spread) ** 2;
+        // Localized falloff: tighter spread so the coin closest to the drag
+        // light visibly brightens instead of the whole ring lifting slightly.
+        const spread = Math.max(3, s.rightLightSoftness * 0.9);
+        const lightFalloff = Math.max(0, 1 - lightDistance / spread) ** 1.5;
         const faceBoost = dragLightOn
-          ? Math.min(0.35, s.light * 0.2 * lightFalloff)
+          ? Math.min(1.8, s.light * 0.7 * lightFalloff)
           : 0;
         entry.faceMats.forEach((m) => {
           m.metalness = 0;
@@ -829,6 +953,7 @@ export default function CoinStudio() {
     if (api.current) api.current.sync(coins);
   }, [coins]);
 
+
   // -------------------------------------------------------------------- EXPORT
   const exportJSON = () => {
     const data = { settings: settings.current, coins };
@@ -859,20 +984,27 @@ export default function CoinStudio() {
     api.current.endExport();
     fetch(url).then((r) => r.blob()).then((b) => download("coin-studio.png", b));
   };
-  const [recording, setRecording] = useState(false);
-  const exportWebM = async () => {
+  const [recording, setRecording] = useState(null);
+  // Shared recorder — the only difference between the WebM and MP4 exports is
+  // the mime candidate list and the file extension.
+  const recordVideo = async (fmt) => {
     if (!api.current || recording) return;
+    const candidates = fmt === "mp4"
+      ? ["video/mp4;codecs=avc1.42E01E", "video/mp4;codecs=h264", "video/mp4"]
+      : ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
+    const mime = candidates.find((m) => MediaRecorder.isTypeSupported(m));
+    if (!mime) {
+      alert(fmt === "mp4"
+        ? "This browser can't record MP4 directly. Use Chrome/Safari, or export WebM and convert with ffmpeg."
+        : "This browser doesn't support WebM recording.");
+      return;
+    }
     const s = settings.current;
-    // Recenter drag orbit and give the interpolation a beat to settle so the
-    // recording opens on a centered ring.
     api.current.resetOrbit();
     const { w, h } = exportDims();
     api.current.beginExport(w, h);
     await new Promise((r) => setTimeout(r, 350));
     const canvasEl = api.current.getCanvas();
-    const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
-      ? "video/webm;codecs=vp9"
-      : "video/webm";
     const stream = canvasEl.captureStream(s.exportFps);
     const rec = new MediaRecorder(stream, {
       mimeType: mime,
@@ -882,20 +1014,29 @@ export default function CoinStudio() {
     rec.ondataavailable = (e) => e.data.size && chunks.push(e.data);
     rec.onstop = () => {
       api.current.endExport();
-      download("coin-studio.webm", new Blob(chunks, { type: mime }));
-      setRecording(false);
+      download(`coin-studio.${fmt}`, new Blob(chunks, { type: mime }));
+      setRecording(null);
     };
-    setRecording(true);
+    setRecording(fmt);
     rec.start();
     setTimeout(() => rec.stop(), Math.max(500, s.exportDuration * 1000));
   };
+  const exportWebM = () => recordVideo("webm");
+  const exportMP4 = () => recordVideo("mp4");
   const [gifting, setGifting] = useState(false);
   const exportGIF = async () => {
     if (!api.current || gifting) return;
     setGifting(true);
+    const s = settings.current;
+    const useTransparent = s.transparentBg;
+    // Bright magenta as the color key — unlikely to appear in coin content, so
+    // only true-empty pixels get flagged transparent (no accidental holes).
+    const GIF_KEY_HEX = 0xff00ff;
+    const GIF_KEY_CSS = "#ff00ff";
+    const origBg = s.bgColor;
+    if (useTransparent) settings.current.bgColor = GIF_KEY_CSS;
     try {
       await loadScript("https://cdn.jsdelivr.net/npm/gif.js@0.2.0/dist/gif.js");
-      const s = settings.current;
       api.current.resetOrbit();
       const { w, h } = exportDims();
       api.current.beginExport(w, h);
@@ -906,7 +1047,7 @@ export default function CoinStudio() {
         quality: s.exportGifQuality,
         width: canvasEl.width,
         height: canvasEl.height,
-        transparent: s.transparentBg ? 0x000000 : null,
+        transparent: useTransparent ? GIF_KEY_HEX : null,
         workerScript: "https://cdn.jsdelivr.net/npm/gif.js@0.2.0/dist/gif.worker.js",
       });
       const totalFrames = Math.max(4, Math.round(s.exportDuration * s.exportFps));
@@ -917,6 +1058,7 @@ export default function CoinStudio() {
       }
       gif.on("finished", (blob) => {
         api.current && api.current.endExport();
+        if (useTransparent) settings.current.bgColor = origBg;
         download("coin-studio.gif", blob);
         setGifting(false);
       });
@@ -924,6 +1066,7 @@ export default function CoinStudio() {
     } catch (e) {
       alert("GIF export failed to load gif.js — check network.");
       api.current && api.current.endExport();
+      if (useTransparent) settings.current.bgColor = origBg;
       setGifting(false);
     }
   };
@@ -994,6 +1137,30 @@ export default function CoinStudio() {
           <Row label="Orbit speed" value={ui.orbitSpeed.toFixed(2)}>
             <Slider min={0} max={2} step={0.01} value={ui.orbitSpeed} onChange={(v) => set({ orbitSpeed: v })} />
           </Row>
+
+          <SectionLabel>Perspective</SectionLabel>
+          <Row label="Mode">
+            <Segment
+              options={[{ v: "ring", l: "Ring" }, { v: "perspective", l: "Perspective" }]}
+              value={ui.perspectiveMode}
+              onChange={(v) => set({ perspectiveMode: v })} />
+          </Row>
+          {ui.perspectiveMode === "perspective" && (
+            <Row label="Flip intensity" value={ui.perspectiveIntensity.toFixed(2)}>
+              <Slider min={0} max={2} step={0.01} value={ui.perspectiveIntensity}
+                onChange={(v) => set({ perspectiveIntensity: v })} />
+            </Row>
+          )}
+          <div className="flex items-center justify-between mb-3">
+            <span className="text-[13px] font-medium text-slate-200">Scatter positions</span>
+            <Switch checked={ui.scatterEnabled} onChange={(v) => set({ scatterEnabled: v })} />
+          </div>
+          {ui.scatterEnabled && (
+            <Row label="Scatter amount" value={ui.scatterAmount.toFixed(2)}>
+              <Slider min={0} max={1} step={0.01} value={ui.scatterAmount}
+                onChange={(v) => set({ scatterAmount: v })} />
+            </Row>
+          )}
 
           <SectionLabel>Layout</SectionLabel>
           <Row label="Overall scale" value={ui.overallScale.toFixed(2)}>
@@ -1081,6 +1248,17 @@ export default function CoinStudio() {
           </div>
 
           <SectionLabel>Coins</SectionLabel>
+          <Row label="Order">
+            <Segment
+              options={[{ v: "asc", l: "Ascending" }, { v: "desc", l: "Descending" }]}
+              value={ui.coinOrder}
+              onChange={(v) => set({ coinOrder: v })} />
+          </Row>
+          <button
+            onClick={() => setCoins((cs) => cs.map((c) => ({ ...c, angleOffset: 0 })))}
+            className="w-full py-1.5 mb-3 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-300 text-[12px] font-medium">
+            Reset all positions
+          </button>
           <div className="flex items-center gap-2 mb-3">
             <label className="text-[12px] text-slate-300 flex-none">Count</label>
             <input type="number" min={1} max={64} value={coins.length}
@@ -1103,7 +1281,7 @@ export default function CoinStudio() {
                       className="px-2 py-0.5 rounded text-[11px] bg-slate-700 hover:bg-rose-600 disabled:opacity-40">✕</button>
                   </div>
                 </div>
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-2 gap-2 mb-2">
                   {["front", "back"].map((side) => (
                     <label key={side} className="flex flex-col gap-1 cursor-pointer">
                       <span className="text-[10px] uppercase tracking-wider text-slate-400">{side}</span>
@@ -1117,6 +1295,20 @@ export default function CoinStudio() {
                     </label>
                   ))}
                 </div>
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-[10px] uppercase tracking-wider text-slate-400">Position</span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] tabular-nums text-slate-400 font-mono">
+                      {Math.round(((c.angleOffset || 0) * 180) / Math.PI)}°
+                    </span>
+                    <button
+                      onClick={() => setCoins((cs) => cs.map((x) => x.key === c.key ? { ...x, angleOffset: 0 } : x))}
+                      className="text-[10px] text-slate-400 hover:text-indigo-300">reset</button>
+                  </div>
+                </div>
+                <Slider min={-180} max={180} step={1}
+                  value={Math.round(((c.angleOffset || 0) * 180) / Math.PI)}
+                  onChange={(deg) => setCoins((cs) => cs.map((x) => x.key === c.key ? { ...x, angleOffset: (deg * Math.PI) / 180 } : x))} />
               </div>
             ))}
           </div>
@@ -1162,7 +1354,7 @@ export default function CoinStudio() {
               onChange={(v) => set({ exportFps: v })} />
           </Row>
           <Row label="Video bitrate (Mbps)" value={ui.exportBitrate.toFixed(0)}>
-            <Slider min={2} max={30} step={1} value={ui.exportBitrate}
+            <Slider min={2} max={80} step={1} value={ui.exportBitrate}
               onChange={(v) => set({ exportBitrate: v })} />
           </Row>
           <Row label="GIF quality (lower=better)" value={ui.exportGifQuality}>
@@ -1178,12 +1370,16 @@ export default function CoinStudio() {
               className="py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-200 text-[12px] font-medium">JSON</button>
             <button onClick={exportPNG}
               className="py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-200 text-[12px] font-medium">PNG</button>
-            <button onClick={exportWebM} disabled={recording}
+            <button onClick={exportWebM} disabled={!!recording}
               className="py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-200 text-[12px] font-medium disabled:opacity-60">
-              {recording ? "Recording…" : "Video (WebM)"}
+              {recording === "webm" ? "Recording…" : "WebM"}
+            </button>
+            <button onClick={exportMP4} disabled={!!recording}
+              className="py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-200 text-[12px] font-medium disabled:opacity-60">
+              {recording === "mp4" ? "Recording…" : "MP4"}
             </button>
             <button onClick={exportGIF} disabled={gifting}
-              className="py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-200 text-[12px] font-medium disabled:opacity-60">
+              className="col-span-2 py-2 rounded-lg border border-slate-700 hover:bg-slate-800 text-slate-200 text-[12px] font-medium disabled:opacity-60">
               {gifting ? "Encoding…" : "GIF"}
             </button>
           </div>
@@ -1258,12 +1454,28 @@ export default function CoinStudio() {
           const preset = EXPORT_PRESETS[ui.exportPreset];
           const w = (preset && preset.w) || ui.exportWidth;
           const h = (preset && preset.h) || ui.exportHeight;
+          // Show the frame at its true proportional size relative to the stage
+          // so dragging it visibly grows and shrinks the crop region.
+          const displayScale = Math.min(
+            (stageSize.w * 0.94) / w,
+            (stageSize.h * 0.94) / h
+          );
+          const cssW = Math.max(24, w * displayScale);
+          const cssH = Math.max(24, h * displayScale);
           return (
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
-              <div className="border-2 border-dashed border-indigo-500/70 shadow-[0_0_0_9999px_rgba(15,23,42,0.35)]"
-                style={{ aspectRatio: `${w}/${h}`, maxWidth: "94%", maxHeight: "94%",
-                         width: "100%", height: "100%" }} />
-              <div className="absolute top-3 left-1/2 -translate-x-1/2 px-2 py-0.5 rounded bg-indigo-500 text-white text-[10px] font-medium">
+              <div data-export-frame className="relative border-2 border-dashed border-indigo-500/70 shadow-[0_0_0_9999px_rgba(15,23,42,0.35)]"
+                style={{ width: `${cssW}px`, height: `${cssH}px` }}>
+                <div onPointerDown={beginFrameResize("n")} className="pointer-events-auto absolute left-6 right-6 -top-1 h-2 cursor-ns-resize" />
+                <div onPointerDown={beginFrameResize("s")} className="pointer-events-auto absolute left-6 right-6 -bottom-1 h-2 cursor-ns-resize" />
+                <div onPointerDown={beginFrameResize("w")} className="pointer-events-auto absolute top-6 bottom-6 -left-1 w-2 cursor-ew-resize" />
+                <div onPointerDown={beginFrameResize("e")} className="pointer-events-auto absolute top-6 bottom-6 -right-1 w-2 cursor-ew-resize" />
+                <div onPointerDown={beginFrameResize("nw")} className="pointer-events-auto absolute -top-1.5 -left-1.5 w-3 h-3 cursor-nwse-resize bg-indigo-500 rounded-sm shadow" />
+                <div onPointerDown={beginFrameResize("ne")} className="pointer-events-auto absolute -top-1.5 -right-1.5 w-3 h-3 cursor-nesw-resize bg-indigo-500 rounded-sm shadow" />
+                <div onPointerDown={beginFrameResize("sw")} className="pointer-events-auto absolute -bottom-1.5 -left-1.5 w-3 h-3 cursor-nesw-resize bg-indigo-500 rounded-sm shadow" />
+                <div onPointerDown={beginFrameResize("se")} className="pointer-events-auto absolute -bottom-1.5 -right-1.5 w-3 h-3 cursor-nwse-resize bg-indigo-500 rounded-sm shadow" />
+              </div>
+              <div className="absolute top-3 left-1/2 -translate-x-1/2 px-2 py-0.5 rounded bg-indigo-500 text-white text-[10px] font-medium pointer-events-none">
                 {w} × {h}
               </div>
             </div>
