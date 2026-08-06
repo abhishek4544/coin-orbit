@@ -1071,6 +1071,11 @@ export default function CoinStudio() {
         // bevel rings so they hug the new rim edges.
         const yScale = s.thick / BASE_THICK;
         entry.body.scale.y = yScale;
+        // Keep both artwork caps attached to the resized rim. Previously only
+        // the rim and bevels moved with Thickness, leaving a visible seam
+        // between the edge and the front/back faces at larger thicknesses.
+        entry.faceFront.position.y = s.thick / 2 + 0.0001;
+        entry.faceBack.position.y = -s.thick / 2 - 0.0001;
         entry.bevelA.position.y = s.thick / 2;
         entry.bevelB.position.y = -s.thick / 2;
         // Halo stays neutral and remains part of the base studio presentation.
